@@ -1,0 +1,206 @@
+#  =====================================================================
+#  release-check
+#  =====================================================================
+#  Keeps the patches applying to Ollama's releases with no human in the
+#  loop, and calls a human only when that fails.
+#
+#  - Daily: check the newest final release. If the patches apply (a
+#    three-way merge) and Ollama's llm and server tests pass, refresh
+#    patches/, move ollama.version and push. Patches upstream already
+#    merged are dropped by the same refresh.
+#  - Push to main: re-check the current pin.
+#  - Manual run: check any tag you name. A named tag never moves the pin.
+#  - Failure: open (or comment on) one issue per tag; a later passing
+#    run for that tag closes it. See ci/alert.sh.
+#  - When the pin moves, or on a manual run, a macOS job does the real
+#    native build.
+
+name: release-check
+
+on:
+    schedule:
+        - cron: "23 7 * * *"
+    push:
+        branches: [main]
+    workflow_dispatch:
+        inputs:
+            tag:
+                description: "Ollama tag (empty: latest final release)"
+                required: false
+                default: ""
+
+permissions:
+    contents: write
+    issues: write
+
+concurrency:
+    group: release-check
+    cancel-in-progress: false
+
+jobs:
+    check:
+        runs-on: ubuntu-latest
+        outputs:
+            tag: ${{ steps.target.outputs.tag }}
+            moved: ${{ steps.pin.outputs.moved }}
+        steps:
+            - uses: actions/checkout@v4
+
+            # The pin moves only when CI chose the tag itself: a daily run,
+            # or a manual run with no tag named.
+            - name: Pick the Ollama tag
+              id: target
+              env:
+                  EVENT: ${{ github.event_name }}
+                  NAMED: ${{ inputs.tag }}
+              run: |
+                  pinned="$(tr -d '[:space:]' < ollama.version)"
+                  latest="$(git ls-remote --tags --refs \
+                      https://github.com/ollama/ollama.git 'v*' |
+                      sed 's|.*refs/tags/||' | grep -v -e '-' |
+                      sort -V | tail -1)"
+
+                  tag="$latest"
+                  may_move=1
+
+                  if [ "$EVENT" = "push" ]; then
+                      tag="$pinned"
+                      may_move=0
+                  fi
+
+                  if [ -n "$NAMED" ]; then
+                      tag="$NAMED"
+                      may_move=0
+                  fi
+
+                  {
+                      echo "tag=$tag"
+                      echo "may_move=$may_move"
+                      echo "gomod=src/ollama-$tag/go.mod"
+                  } >> "$GITHUB_OUTPUT"
+                  echo "Checking Ollama $tag (pinned: $pinned)"
+
+            - name: Fetch Ollama
+              env:
+                  TAG: ${{ steps.target.outputs.tag }}
+              run: ./build.sh --fetch-only --tag "$TAG"
+
+            - uses: actions/setup-go@v5
+              with:
+                  go-version-file: ${{ steps.target.outputs.gomod }}
+                  cache: false
+
+            - name: Apply patches and test
+              id: prepare
+              env:
+                  TAG: ${{ steps.target.outputs.tag }}
+                  MAY_MOVE: ${{ steps.target.outputs.may_move }}
+              run: |
+                  refresh=""
+                  if [ "$MAY_MOVE" = "1" ]; then
+                      refresh="--refresh"
+                  fi
+
+                  set +e
+                  ./build.sh --prepare-only --tag "$TAG" $refresh 2>&1 |
+                      tee "$RUNNER_TEMP/prepare.log"
+                  code="${PIPESTATUS[0]}"
+                  set -e
+
+                  echo "code=$code" >> "$GITHUB_OUTPUT"
+
+            - name: Move the pin
+              id: pin
+              if: steps.prepare.outputs.code == '0'
+              env:
+                  TAG: ${{ steps.target.outputs.tag }}
+              run: |
+                  git add patches ollama.version
+
+                  if git diff --cached --quiet; then
+                      echo "moved=0" >> "$GITHUB_OUTPUT"
+                      exit 0
+                  fi
+
+                  git config user.name "github-actions[bot]"
+                  git config user.email \
+                      "41898282+github-actions[bot]@users.noreply.github.com"
+                  git commit -m "Pin Ollama $TAG and refresh patches"
+                  git push
+                  echo "moved=1" >> "$GITHUB_OUTPUT"
+
+            - name: Close a resolved alert
+              if: steps.prepare.outputs.code == '0'
+              env:
+                  GH_TOKEN: ${{ github.token }}
+                  TAG: ${{ steps.target.outputs.tag }}
+              run: ci/alert.sh close patches "$TAG"
+
+            - name: Alert a human
+              if: steps.prepare.outputs.code != '0'
+              env:
+                  GH_TOKEN: ${{ github.token }}
+                  TAG: ${{ steps.target.outputs.tag }}
+                  CODE: ${{ steps.prepare.outputs.code }}
+              run: |
+                  case "$CODE" in
+                      2) why="A patch conflicts after a three-way merge." ;;
+                      3) why="The patches apply, but Ollama's tests fail." ;;
+                      *) why="build.sh exited with code $CODE." ;;
+                  esac
+
+                  ci/alert.sh open patches "$TAG" "$why" \
+                      "$RUNNER_TEMP/prepare.log"
+                  exit 1
+
+    build-macos:
+        needs: check
+        if: >-
+            needs.check.outputs.moved == '1' ||
+            github.event_name == 'workflow_dispatch'
+        runs-on: macos-latest
+        steps:
+            # After a pin move, build what was just pushed, not the old
+            # commit that started the run.
+            - uses: actions/checkout@v4
+              with:
+                  ref: >-
+                      ${{ needs.check.outputs.moved == '1'
+                      && 'main' || github.sha }}
+
+            - name: Fetch Ollama
+              id: fetch
+              env:
+                  TAG: ${{ needs.check.outputs.tag }}
+              run: |
+                  ./build.sh --fetch-only --tag "$TAG"
+                  echo "gomod=src/ollama-$TAG/go.mod" >> "$GITHUB_OUTPUT"
+
+            - uses: actions/setup-go@v5
+              with:
+                  go-version-file: ${{ steps.fetch.outputs.gomod }}
+                  cache: false
+
+            - name: Native build and install
+              env:
+                  TAG: ${{ needs.check.outputs.tag }}
+              run: |
+                  ./build.sh --tag "$TAG" --no-check --no-mlx \
+                      --prefix "$RUNNER_TEMP/ollama-saxby"
+                  "$RUNNER_TEMP/ollama-saxby/current/bin/ollama" --version
+
+            - name: Close a resolved alert
+              if: success()
+              env:
+                  GH_TOKEN: ${{ github.token }}
+                  TAG: ${{ needs.check.outputs.tag }}
+              run: ci/alert.sh close build "$TAG"
+
+            - name: Alert a human
+              if: failure()
+              env:
+                  GH_TOKEN: ${{ github.token }}
+                  TAG: ${{ needs.check.outputs.tag }}
+              run: |
+                  ci/alert.sh open build "$TAG" \
+                      "The patches apply and test, but the macOS build fails."
