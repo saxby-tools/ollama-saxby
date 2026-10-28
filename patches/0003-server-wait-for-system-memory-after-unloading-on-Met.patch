@@ -1,0 +1,189 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Niko Lowry <niko@neeks.me>
+Date: Mon, 26 Oct 2026 22:15:55 -0400
+Subject: [PATCH 3/3] server: wait for system memory after unloading on Metal
+
+waitForVRAMRecovery returned at once for Metal and integrated GPUs.
+Those devices share system memory, and the scheduler checks system free
+memory before the next load. The OS returns a killed runner's pages
+gradually, so the next check saw almost nothing freed and evicted
+another model.
+
+On an M5 Max, unloading a 12 GiB runner returned its memory over about
+240 ms. In the log, evicting a 52 GiB runner to load another model
+moved system free from 37.4 to 37.8 GiB on the immediate re-check, so
+the scheduler evicted a second model, which it reloaded 13 s later.
+
+Shared-memory runners now wait on system free memory, with the same
+75% target and timeout discrete GPUs use. The recovered amount is now
+clamped at zero; before, a drop in free memory underflowed and counted
+as recovery.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ server/sched.go      | 52 ++++++++++++++++++--------------
+ server/sched_test.go | 71 ++++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 101 insertions(+), 22 deletions(-)
+
+diff --git a/server/sched.go b/server/sched.go
+index 8237874..a2918eb 100644
+--- a/server/sched.go
++++ b/server/sched.go
+@@ -1482,26 +1482,40 @@ func (runner *runnerRef) needsReload(ctx context.Context, req *LlmRequest) bool
+ // a before and after GPU memory allocation.  The returned channel
+ // will be notified when we're done waiting, or have timed out and should
+ // proceed anyway
++//
++// Metal and integrated GPUs share system memory, and the scheduler checks
++// system free memory before the next load. The OS returns a killed runner's
++// pages gradually (about 50 GiB/s measured on Apple Silicon), so without a
++// wait the next load sees almost nothing freed and evicts another model.
++// Those runners wait on system free memory instead of GPU free memory.
+ func (s *Scheduler) waitForVRAMRecovery(runner *runnerRef, runners []ml.FilteredRunnerDiscovery) chan any {
+ 	finished := make(chan any, 1)
+ 
+-	// CPU, Metal and iGPUs don't need checking, so no waiting required
+-	if len(runner.gpus) == 0 || !runner.discreteGPUs ||
+-		(len(runner.gpus) == 1 && runner.gpus[0].Library == "Metal") {
++	sharedMemory := !runner.discreteGPUs ||
++		(len(runner.gpus) == 1 && runner.gpus[0].Library == "Metal")
++
++	// CPU runners, and runners with no recorded VRAM, have nothing to wait for
++	if len(runner.gpus) == 0 || runner.vramSize == 0 ||
++		(sharedMemory && s.getSystemInfoFn == nil) {
+ 		finished <- struct{}{}
+ 		slog.Debug("no need to wait for VRAM recovery", "runner", runner)
+ 		return finished
+ 	}
+ 	start := time.Now()
+ 
+-	// Establish a baseline before we unload
+-	gpusBefore := s.getGpuFn(context.Background(), runners)
+-	var totalMemoryBefore, freeMemoryBefore uint64
+-	for _, gpu := range gpusBefore {
+-		totalMemoryBefore += gpu.TotalMemory
+-		freeMemoryBefore += gpu.FreeMemory
++	freeMemory := func(ctx context.Context) uint64 {
++		if sharedMemory {
++			return s.getSystemInfoFn().FreeMemory
++		}
++		var free uint64
++		for _, gpu := range s.getGpuFn(ctx, runners) {
++			free += gpu.FreeMemory
++		}
++		return free
+ 	}
+-	totalMemoryNow := totalMemoryBefore
++
++	// Establish a baseline before we unload
++	freeMemoryBefore := freeMemory(context.Background())
+ 	freeMemoryNow := freeMemoryBefore
+ 
+ 	go func() {
+@@ -1513,21 +1527,15 @@ func (s *Scheduler) waitForVRAMRecovery(runner *runnerRef, runners []ml.Filtered
+ 		for {
+ 			select {
+ 			case <-ticker.C:
+-				// Query GPUs, look for free to go back up
+-				gpusNow := s.getGpuFn(ctx, runners)
+-				totalMemoryNow = 0
+-				freeMemoryNow = 0
+-				for _, gpu := range gpusNow {
+-					totalMemoryNow += gpu.TotalMemory
+-					freeMemoryNow += gpu.FreeMemory
+-				}
++				// Look for free memory to go back up
++				freeMemoryNow = freeMemory(ctx)
++				var recovered uint64
+ 				if freeMemoryNow > freeMemoryBefore {
+-					logutil.Trace("gpu VRAM convergence", "percent", int(float32(freeMemoryNow-freeMemoryBefore)/float32(runner.vramSize)*100))
+-				} else {
+-					logutil.Trace("gpu VRAM convergence", "percent", 0)
++					recovered = freeMemoryNow - freeMemoryBefore
+ 				}
++				logutil.Trace("gpu VRAM convergence", "percent", int(float32(recovered)/float32(runner.vramSize)*100))
+ 				// If we're within ~75% of the estimated memory usage recovered, bail out
+-				if float32(freeMemoryNow-freeMemoryBefore) > float32(runner.vramSize)*0.75 {
++				if float32(recovered) > float32(runner.vramSize)*0.75 {
+ 					slog.Debug(fmt.Sprintf("gpu VRAM free memory converged after %0.2f seconds", time.Since(start).Seconds()), "free_before", format.HumanBytes2(freeMemoryBefore), "free_now", format.HumanBytes2(freeMemoryNow), "runner", runner)
+ 					finished <- struct{}{}
+ 					return
+diff --git a/server/sched_test.go b/server/sched_test.go
+index 8d84ee0..ecedf86 100644
+--- a/server/sched_test.go
++++ b/server/sched_test.go
+@@ -2304,3 +2304,74 @@ func TestSchedulerTracksMultipleLoadedRunners(t *testing.T) {
+ 	expectedFree := uint64(24*format.GigaByte) - uint64(8*format.GigaByte) - uint64(4*format.GigaByte)
+ 	require.Equal(t, expectedFree, gpus[0].FreeMemory)
+ }
++
++func TestWaitForVRAMRecoverySharedMemory(t *testing.T) {
++	metal := []ml.DeviceID{{Library: "Metal"}}
++
++	// systemFree returns before for the baseline read, then after.
++	systemFree := func(before, after uint64) (func() ml.SystemInfo, *atomic.Int32) {
++		var calls atomic.Int32
++		return func() ml.SystemInfo {
++			if calls.Add(1) == 1 {
++				return ml.SystemInfo{FreeMemory: before}
++			}
++			return ml.SystemInfo{FreeMemory: after}
++		}, &calls
++	}
++
++	waitTime := func(s *Scheduler, runner *runnerRef) time.Duration {
++		start := time.Now()
++		select {
++		case <-s.waitForVRAMRecovery(runner, nil):
++		case <-time.After(5 * time.Second):
++			t.Fatal("wait never finished")
++		}
++		return time.Since(start)
++	}
++
++	t.Run("metal waits for system memory to come back", func(t *testing.T) {
++		fn, calls := systemFree(10*format.GibiByte, 20*format.GibiByte)
++		s := &Scheduler{getSystemInfoFn: fn, waitForRecovery: 5 * time.Second}
++		runner := &runnerRef{gpus: metal, discreteGPUs: true, vramSize: 10 * format.GibiByte}
++
++		if took := waitTime(s, runner); took >= time.Second {
++			t.Errorf("took %v to see memory that came back on the first poll", took)
++		}
++		if calls.Load() < 2 {
++			t.Errorf("system memory read %d times, want a baseline and at least one poll", calls.Load())
++		}
++	})
++
++	t.Run("metal waits out the timeout when memory never comes back", func(t *testing.T) {
++		fn, _ := systemFree(10*format.GibiByte, 10*format.GibiByte)
++		s := &Scheduler{getSystemInfoFn: fn, waitForRecovery: 300 * time.Millisecond}
++		runner := &runnerRef{gpus: metal, discreteGPUs: true, vramSize: 10 * format.GibiByte}
++
++		if took := waitTime(s, runner); took < 300*time.Millisecond {
++			t.Errorf("finished after %v, before the 300ms timeout", took)
++		}
++	})
++
++	t.Run("a drop in free memory is not recovery", func(t *testing.T) {
++		fn, _ := systemFree(20*format.GibiByte, 5*format.GibiByte)
++		s := &Scheduler{getSystemInfoFn: fn, waitForRecovery: 300 * time.Millisecond}
++		runner := &runnerRef{gpus: metal, discreteGPUs: true, vramSize: 10 * format.GibiByte}
++
++		if took := waitTime(s, runner); took < 300*time.Millisecond {
++			t.Errorf("finished after %v; a drop in free memory counted as recovery", took)
++		}
++	})
++
++	t.Run("cpu runners do not wait", func(t *testing.T) {
++		fn, calls := systemFree(10*format.GibiByte, 10*format.GibiByte)
++		s := &Scheduler{getSystemInfoFn: fn, waitForRecovery: 5 * time.Second}
++		runner := &runnerRef{vramSize: 10 * format.GibiByte}
++
++		if took := waitTime(s, runner); took >= 100*time.Millisecond {
++			t.Errorf("cpu runner waited %v", took)
++		}
++		if calls.Load() != 0 {
++			t.Errorf("cpu runner read system memory %d times", calls.Load())
++		}
++	})
++}

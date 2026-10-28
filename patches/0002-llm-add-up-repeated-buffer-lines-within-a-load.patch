@@ -1,0 +1,115 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Niko Lowry <niko@neeks.me>
+Date: Mon, 26 Oct 2026 22:13:08 -0400
+Subject: [PATCH 2/3] llm: add up repeated buffer lines within a load
+
+memoryParsingWriter stored each buffer line under its component,
+backend and kind, so a repeated key overwrote the one before. That
+replaces a fit probe's buffers with the final load's, as intended, but
+llama.cpp also repeats a key within one load: mmapped weights arrive as
+many consecutive model lines, and an iSWA model reports its full and
+sliding-window caches as two KV lines. Only the last of each counted.
+
+gemma4:31b on Metal prints 62 MTL0_Mapped model lines (17790 MiB) and
+two KV lines (10880 + 1275 MiB). Ollama tracked about 5.8 GiB for a
+runner using about 33 GiB, which `ollama ps` showed as 5.2 GB and the
+scheduler used as the runner's VRAM, overstating free memory.
+
+Consecutive lines with the same key now add up. A key that returns
+after other buffer lines still starts over, so fit probes are still
+replaced by the final load.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ llm/llama_server.go      | 18 ++++++++++++++++--
+ llm/llama_server_test.go | 34 ++++++++++++++++++++++++++++++++++
+ 2 files changed, 50 insertions(+), 2 deletions(-)
+
+diff --git a/llm/llama_server.go b/llm/llama_server.go
+index a5a52c7..20c9a69 100644
+--- a/llm/llama_server.go
++++ b/llm/llama_server.go
+@@ -2990,10 +2990,18 @@ func kvCacheBytesPer32(cacheType string) uint64 {
+ //	CUDA_Host compute buffer size =   268.05 MiB
+ //	MTL0_Mapped model buffer size =  1918.35 MiB
+ //	ROCm0 model buffer size =  1918.35 MiB
++//
++// llama.cpp prints one line per buffer, so one key can repeat within a load:
++// large mmapped weights arrive as many consecutive model lines, and an iSWA
++// model reports its full and sliding-window caches as two KV lines.
++// Consecutive lines with the same key add up. A key that returns after other
++// buffer lines starts over, so a fit probe's buffers are replaced by the
++// final load's.
+ type memoryParsingWriter struct {
+ 	inner   io.Writer
+ 	runner  *llamaServerRunner
+ 	buffers map[memoryBufferKey]memoryBuffer
++	lastKey *memoryBufferKey
+ }
+ 
+ type memoryBufferKey struct {
+@@ -3084,11 +3092,17 @@ func (w *memoryParsingWriter) Write(b []byte) (int, error) {
+ 					if w.buffers == nil {
+ 						w.buffers = make(map[memoryBufferKey]memoryBuffer)
+ 					}
+-					w.buffers[memoryBufferKey{
++					key := memoryBufferKey{
+ 						component: string(match[1]),
+ 						backend:   backendName,
+ 						kind:      string(match[3]),
+-					}] = memoryBuffer{bytes: uint64(mib * 1024 * 1024)}
++					}
++					bytes := uint64(mib * 1024 * 1024)
++					if w.lastKey != nil && *w.lastKey == key {
++						bytes += w.buffers[key].bytes
++					}
++					w.buffers[key] = memoryBuffer{bytes: bytes}
++					w.lastKey = &key
+ 					w.updateRunnerMemoryLocked()
+ 				}
+ 			}
+diff --git a/llm/llama_server_test.go b/llm/llama_server_test.go
+index 4ab8bb1..dce5457 100644
+--- a/llm/llama_server_test.go
++++ b/llm/llama_server_test.go
+@@ -3133,6 +3133,40 @@ func TestMemoryParsingWriter(t *testing.T) {
+ 			wantGPU:   1100 + 2200 + 330 + 10 + 20,
+ 			wantTotal: 1100 + 2200 + 330 + 440 + 10 + 20,
+ 		},
++		{
++			// Order taken from a gemma4:31b load on Metal: mmapped weights in
++			// chunks, then an iSWA model's full and sliding-window caches.
++			name: "chunked weights and iswa caches add up",
++			lines: []string{
++				"load_tensors:   CPU_Mapped model buffer size =  1102.50 MiB\n",
++				"load_tensors:  MTL0_Mapped model buffer size =   290.80 MiB\n",
++				"load_tensors:  MTL0_Mapped model buffer size =   290.84 MiB\n",
++				"load_tensors:  MTL0_Mapped model buffer size =  1102.52 MiB\n",
++				"llama_context:        CPU  output buffer size =     1.00 MiB\n",
++				"llama_kv_cache_iswa: creating non-SWA KV cache, size = 262144 cells\n",
++				"llama_kv_cache:       MTL0 KV buffer size = 10880.00 MiB\n",
++				"llama_kv_cache_iswa: creating     SWA KV cache, size = 3072 cells\n",
++				"llama_kv_cache:       MTL0 KV buffer size =  1275.00 MiB\n",
++				"sched_reserve:       MTL0 compute buffer size =  3575.00 MiB\n",
++			},
++			wantGPU:   290.80 + 290.84 + 1102.52 + 10880 + 1275 + 3575,
++			wantTotal: 1102.50 + 290.80 + 290.84 + 1102.52 + 1 + 10880 + 1275 + 3575,
++		},
++		{
++			name: "chunked fit probe is replaced by chunked final load",
++			lines: []string{
++				"load_tensors:  MTL0_Mapped model buffer size =   100.00 MiB\n",
++				"load_tensors:  MTL0_Mapped model buffer size =   100.00 MiB\n",
++				"llama_kv_cache:       MTL0 KV buffer size =   500.00 MiB\n",
++				"sched_reserve:       MTL0 compute buffer size =    50.00 MiB\n",
++				"load_tensors:  MTL0_Mapped model buffer size =   200.00 MiB\n",
++				"load_tensors:  MTL0_Mapped model buffer size =   200.00 MiB\n",
++				"llama_kv_cache:       MTL0 KV buffer size =   600.00 MiB\n",
++				"sched_reserve:       MTL0 compute buffer size =    60.00 MiB\n",
++			},
++			wantGPU:   200 + 200 + 600 + 60,
++			wantTotal: 200 + 200 + 600 + 60,
++		},
+ 		{
+ 			name: "rc21 fit probe accounting",
+ 			lines: []string{
