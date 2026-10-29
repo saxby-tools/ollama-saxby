@@ -38,10 +38,10 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  4 files changed, 316 insertions(+), 17 deletions(-)
 
 diff --git a/llm/llama_server.go b/llm/llama_server.go
-index 5805edd..a5a52c7 100644
+index db6d743..95df56a 100644
 --- a/llm/llama_server.go
 +++ b/llm/llama_server.go
-@@ -2838,25 +2838,144 @@ func (s *llamaServerRunner) MemorySize() (total, vram uint64) {
+@@ -2848,25 +2848,144 @@ func (s *llamaServerRunner) MemorySize() (total, vram uint64) {
  	return total, vram
  }
  
@@ -200,7 +200,7 @@ index 5805edd..a5a52c7 100644
  
  // memoryParsingWriter wraps an io.Writer and parses llama-server log output
 diff --git a/llm/llama_server_test.go b/llm/llama_server_test.go
-index 68c7985..4ab8bb1 100644
+index 7bb0880..31ce508 100644
 --- a/llm/llama_server_test.go
 +++ b/llm/llama_server_test.go
 @@ -8,6 +8,7 @@ import (
@@ -211,7 +211,7 @@ index 68c7985..4ab8bb1 100644
  	"net"
  	"net/http"
  	"net/http/httptest"
-@@ -4035,3 +4036,180 @@ func TestLlamaServerCompletionThinkingFormat(t *testing.T) {
+@@ -4058,3 +4059,180 @@ func TestLlamaServerCompletionThinkingFormat(t *testing.T) {
  		t.Errorf("json format converted a schema, %d conversions", got)
  	}
  }
@@ -393,7 +393,7 @@ index 68c7985..4ab8bb1 100644
 +	}
 +}
 diff --git a/server/sched.go b/server/sched.go
-index 2c8d818..8237874 100644
+index e1323b9..32a231b 100644
 --- a/server/sched.go
 +++ b/server/sched.go
 @@ -576,7 +576,7 @@ func (s *Scheduler) load(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.De

@@ -26,10 +26,10 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  2 files changed, 50 insertions(+), 2 deletions(-)
 
 diff --git a/llm/llama_server.go b/llm/llama_server.go
-index a5a52c7..20c9a69 100644
+index 95df56a..2ddd90f 100644
 --- a/llm/llama_server.go
 +++ b/llm/llama_server.go
-@@ -2990,10 +2990,18 @@ func kvCacheBytesPer32(cacheType string) uint64 {
+@@ -3000,10 +3000,18 @@ func kvCacheBytesPer32(cacheType string) uint64 {
  //	CUDA_Host compute buffer size =   268.05 MiB
  //	MTL0_Mapped model buffer size =  1918.35 MiB
  //	ROCm0 model buffer size =  1918.35 MiB
@@ -48,7 +48,7 @@ index a5a52c7..20c9a69 100644
  }
  
  type memoryBufferKey struct {
-@@ -3084,11 +3092,17 @@ func (w *memoryParsingWriter) Write(b []byte) (int, error) {
+@@ -3094,11 +3102,17 @@ func (w *memoryParsingWriter) Write(b []byte) (int, error) {
  					if w.buffers == nil {
  						w.buffers = make(map[memoryBufferKey]memoryBuffer)
  					}
@@ -69,10 +69,10 @@ index a5a52c7..20c9a69 100644
  				}
  			}
 diff --git a/llm/llama_server_test.go b/llm/llama_server_test.go
-index 4ab8bb1..dce5457 100644
+index 31ce508..f7ebebf 100644
 --- a/llm/llama_server_test.go
 +++ b/llm/llama_server_test.go
-@@ -3133,6 +3133,40 @@ func TestMemoryParsingWriter(t *testing.T) {
+@@ -3156,6 +3156,40 @@ func TestMemoryParsingWriter(t *testing.T) {
  			wantGPU:   1100 + 2200 + 330 + 10 + 20,
  			wantTotal: 1100 + 2200 + 330 + 440 + 10 + 20,
  		},

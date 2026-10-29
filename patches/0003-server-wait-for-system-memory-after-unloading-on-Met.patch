@@ -26,7 +26,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  2 files changed, 101 insertions(+), 22 deletions(-)
 
 diff --git a/server/sched.go b/server/sched.go
-index 8237874..a2918eb 100644
+index 32a231b..746623e 100644
 --- a/server/sched.go
 +++ b/server/sched.go
 @@ -1482,26 +1482,40 @@ func (runner *runnerRef) needsReload(ctx context.Context, req *LlmRequest) bool
