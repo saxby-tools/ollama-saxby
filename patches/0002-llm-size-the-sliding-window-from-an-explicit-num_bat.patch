@@ -1,0 +1,188 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Niko Lowry <niko@neeks.me>
+Date: Fri, 30 Oct 2026 15:33:34 -0400
+Subject: [PATCH 2/2] llm: size the sliding window from an explicit num_batch
+
+The window term assumed -ub tops out at 2048, which holds only for the
+automatic batch. An explicit num_batch from the request or Modelfile
+reaches llama-server as -ub through appendBatchArgs, and llama.cpp
+sizes the sliding cache as pad(n_swa + n_ubatch, 256). For gemma4:31b
+with num_batch 8192 that is 9216 cells against the 3072 predicted, so
+the 50 sliding layers came out 2550 MiB under the allocation.
+
+The prediction now takes the request's num_batch and sizes the window
+with max(2048, num_batch). Automatic requests are unchanged, since the
+automatic batch never exceeds 2048.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ llm/llama_server.go      | 20 ++++++++++++--------
+ llm/llama_server_test.go | 31 ++++++++++++++++++++++++++-----
+ server/sched.go          |  8 ++++----
+ 3 files changed, 42 insertions(+), 17 deletions(-)
+
+diff --git a/llm/llama_server.go b/llm/llama_server.go
+index a5a52c70..9076e502 100644
+--- a/llm/llama_server.go
++++ b/llm/llama_server.go
+@@ -2838,18 +2838,21 @@ func (s *llamaServerRunner) MemorySize() (total, vram uint64) {
+ 	return total, vram
+ }
+ 
+-// llamaServerMaxUbatch is the largest physical batch (-ub) Ollama passes to
+-// llama-server. A sliding-window cache holds the window plus one batch, so
+-// sizing it with the largest batch keeps the estimate from falling short.
++// llamaServerMaxUbatch is the largest physical batch (-ub) the automatic
++// batch selection passes to llama-server. A sliding-window cache holds the
++// window plus one batch, so the window is sized with the larger of this and
++// an explicit num_batch, which appendBatchArgs passes through as -ub.
+ const llamaServerMaxUbatch = 2048
+ 
+ // PredictServerVRAM estimates VRAM usage for a model without spawning llama-server.
+ // Weights use the model file size, which also covers a projector stored in the
+ // same file. The KV cache follows llama.cpp's per-layer allocation. The compute
+-// graph is not counted; the scheduler's headroom absorbs it.
+-func PredictServerVRAM(modelPath string, f *gguf.Model, numCtx, numParallel int) uint64 {
++// graph is not counted; the scheduler's headroom absorbs it. numBatch is the
++// request's num_batch; the automatic batch, chosen later, never exceeds
++// llamaServerMaxUbatch.
++func PredictServerVRAM(modelPath string, f *gguf.Model, numCtx, numParallel, numBatch int) uint64 {
+ 	weights := modelFileSize(modelPath, f)
+-	kvCache := predictKVCache(f.KV(), numCtx, numParallel, envconfig.KvCacheType())
++	kvCache := predictKVCache(f.KV(), numCtx, numParallel, numBatch, envconfig.KvCacheType())
+ 
+ 	return weights + kvCache
+ }
+@@ -2859,7 +2862,7 @@ func PredictServerVRAM(modelPath string, f *gguf.Model, numCtx, numParallel int)
+ // no KV heads (recurrent layers in hybrid models) store nothing, layers marked
+ // in sliding_window_pattern store only the window, and non-causal models
+ // (embedding encoders) keep no cache at all.
+-func predictKVCache(kv *gguf.Metadata, numCtx, numParallel int, cacheType string) uint64 {
++func predictKVCache(kv *gguf.Metadata, numCtx, numParallel, numBatch int, cacheType string) uint64 {
+ 	if !kv.Bool("attention.causal", true) {
+ 		return 0
+ 	}
+@@ -2885,7 +2888,8 @@ func predictKVCache(kv *gguf.Metadata, numCtx, numParallel int, cacheType string
+ 	}
+ 
+ 	cells := uint64(max(numCtx, 0))
+-	swaCells := min(cells, uint64(max(numParallel, 1))*(window+llamaServerMaxUbatch))
++	ubatch := uint64(max(llamaServerMaxUbatch, numBatch))
++	swaCells := min(cells, uint64(max(numParallel, 1))*(window+ubatch))
+ 	swaCells = (swaCells + 255) / 256 * 256
+ 
+ 	widthK := make([]uint64, layers)
+diff --git a/llm/llama_server_test.go b/llm/llama_server_test.go
+index 4ab8bb19..b5c5c554 100644
+--- a/llm/llama_server_test.go
++++ b/llm/llama_server_test.go
+@@ -4079,6 +4079,7 @@ func TestPredictKVCache(t *testing.T) {
+ 		kv          gguftest.KV
+ 		numCtx      int
+ 		numParallel int
++		numBatch    int
+ 		cacheType   string
+ 		want        uint64
+ 	}{
+@@ -4141,6 +4142,19 @@ func TestPredictKVCache(t *testing.T) {
+ 			numCtx: 1024, numParallel: 1, cacheType: "q8_0",
+ 			want: (4*8+4*8)*1024*34/32 + (2*16+2*16)*1024*34/32,
+ 		},
++		{
++			// An explicit num_batch reaches llama-server as -ub, so the
++			// window holds it: 256 + 8192 = 8448 cells.
++			name: "explicit num_batch widens the window", kv: sliding,
++			numCtx: 32768, numParallel: 1, numBatch: 8192, cacheType: "q8_0",
++			want: (4*8+4*8)*8448*34/32 + (2*16+2*16)*32768*34/32,
++		},
++		{
++			// A num_batch below the automatic maximum changes nothing.
++			name: "small num_batch keeps the automatic window", kv: sliding,
++			numCtx: 32768, numParallel: 1, numBatch: 512, cacheType: "q8_0",
++			want: (4*8+4*8)*2304*34/32 + (2*16+2*16)*32768*34/32,
++		},
+ 		{
+ 			name: "scalar pattern sizes every layer as full",
+ 			kv: with(sliding, gguftest.KV{
+@@ -4166,7 +4180,7 @@ func TestPredictKVCache(t *testing.T) {
+ 	for _, tc := range cases {
+ 		t.Run(tc.name, func(t *testing.T) {
+ 			kv := loadTestGGUF(t, tc.kv).KV()
+-			got := predictKVCache(kv, tc.numCtx, tc.numParallel, tc.cacheType)
++			got := predictKVCache(kv, tc.numCtx, tc.numParallel, tc.numBatch, tc.cacheType)
+ 			if got != tc.want {
+ 				t.Errorf("predictKVCache() = %d, want %d", got, tc.want)
+ 			}
+@@ -4176,9 +4190,10 @@ func TestPredictKVCache(t *testing.T) {
+ 
+ // TestPredictKVCacheGemma4 checks the estimate against what llama-server
+ // allocated for gemma4:31b at 262144 context with a q8_0 cache and -ub 2048,
+-// the largest batch the estimate assumes: 10880 MiB for the 10 full layers
+-// plus 1275 MiB for the 50 sliding layers (3072 cells). The estimate may not
+-// fall below that, and should stay close to it.
++// the largest automatic batch: 10880 MiB for the 10 full layers plus 1275 MiB
++// for the 50 sliding layers (3072 cells). The estimate may not fall below
++// that, and should stay close to it. With an explicit num_batch of 8192 the
++// sliding cache grows to 9216 cells, 3825 MiB, and the estimate must follow.
+ func TestPredictKVCacheGemma4(t *testing.T) {
+ 	headCountKV := make([]uint32, 60)
+ 	pattern := make([]bool, 60)
+@@ -4205,11 +4220,17 @@ func TestPredictKVCacheGemma4(t *testing.T) {
+ 	}).KV()
+ 
+ 	const measured = (10880 + 1275) << 20
+-	got := predictKVCache(kv, 262144, 1, "q8_0")
++	got := predictKVCache(kv, 262144, 1, 0, "q8_0")
+ 	if got < measured {
+ 		t.Errorf("predicted %d MiB, below the %d MiB llama-server allocated", got>>20, measured>>20)
+ 	}
+ 	if got > measured*11/10 {
+ 		t.Errorf("predicted %d MiB, more than 10%% above the %d MiB llama-server allocated", got>>20, measured>>20)
+ 	}
++
++	const measuredWideBatch = (10880 + 3825) << 20
++	got = predictKVCache(kv, 262144, 1, 8192, "q8_0")
++	if got != measuredWideBatch {
++		t.Errorf("with num_batch 8192 predicted %d MiB, want %d MiB", got>>20, measuredWideBatch>>20)
++	}
+ }
+diff --git a/server/sched.go b/server/sched.go
+index 82378746..fe79fd1d 100644
+--- a/server/sched.go
++++ b/server/sched.go
+@@ -576,7 +576,7 @@ func (s *Scheduler) load(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.De
+ 			}
+ 
+ 			predictedCtx := effectiveLlamaServerContext(req.opts.NumCtx, f, numParallel)
+-			predicted := llm.PredictServerVRAM(req.model.ModelPath, f, predictedCtx, numParallel)
++			predicted := llm.PredictServerVRAM(req.model.ModelPath, f, predictedCtx, numParallel, req.opts.NumBatch)
+ 			loadGpus, launchOpts = selectLlamaServerPlacement(systemInfo, gpus, predicted, req.opts)
+ 			availableForBatch, _, _ := availableMemoryForPlacement(systemInfo, loadGpus, launchOpts)
+ 			flashAttention := llm.LlamaServerFlashAttention(loadGpus)
+@@ -829,7 +829,7 @@ func (req *LlmRequest) reduceAutoNumCtxForLoadOOM(f *gguf.Model, numParallel int
+ 
+ 	req.opts.NumCtx = newNumCtx
+ 	predictedCtx := effectiveLlamaServerContext(req.opts.NumCtx, f, numParallel)
+-	predictedVRAM := llm.PredictServerVRAM(req.model.ModelPath, f, predictedCtx, numParallel)
++	predictedVRAM := llm.PredictServerVRAM(req.model.ModelPath, f, predictedCtx, numParallel, req.opts.NumBatch)
+ 	available, _, _ := availableMemoryForPlacement(systemInfo, gpus, launchOpts)
+ 	req.applyAutomaticGenerationBatch(completion, predictedCtx, predictedVRAM, available, llm.LlamaServerFlashAttention(gpus), gpus)
+ 	newNumBatch = req.opts.NumBatch
+@@ -1173,7 +1173,7 @@ func logSelectedGPUGroup(all, selected []ml.DeviceInfo) {
+ 
+ func (s *Scheduler) applyLlamaServerMmapDefaults(req *LlmRequest, launchOpts api.Options, systemInfo ml.SystemInfo, gpus []ml.DeviceInfo, f *gguf.Model, numParallel int) api.Options {
+ 	predictedCtx := effectiveLlamaServerContext(req.opts.NumCtx, f, numParallel)
+-	predictedVRAM := llm.PredictServerVRAM(req.model.ModelPath, f, predictedCtx, numParallel)
++	predictedVRAM := llm.PredictServerVRAM(req.model.ModelPath, f, predictedCtx, numParallel, req.opts.NumBatch)
+ 	availableVRAM, _, _ := availableMemoryForPlacement(systemInfo, gpus, launchOpts)
+ 
+ 	if reason := disableMmapDefaultReason(runtime.GOOS, req.opts, gpus, f.KV().BlockCount(), predictedVRAM, availableVRAM); reason != "" {
+@@ -1237,7 +1237,7 @@ func (s *Scheduler) maybeDisableMmapForHostPressure(req *LlmRequest, launchOpts
+ 	modelSize := modelFileSize(req.model.modelPaths()...)
+ 	loadedMmapSize := s.loadedMmapModelSizeLocked()
+ 	predictedCtx := effectiveLlamaServerContext(req.opts.NumCtx, f, numParallel)
+-	predictedVRAM := llm.PredictServerVRAM(req.model.ModelPath, f, predictedCtx, numParallel)
++	predictedVRAM := llm.PredictServerVRAM(req.model.ModelPath, f, predictedCtx, numParallel, req.opts.NumBatch)
+ 	availableVRAM, _, _ := availableMemoryForPlacement(systemInfo, gpus, launchOpts)
+ 	placementGpus := gpusForPlacement(gpus, launchOpts)
+ 

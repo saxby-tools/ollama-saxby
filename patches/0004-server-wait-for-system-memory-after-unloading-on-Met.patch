@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Niko Lowry <niko@neeks.me>
 Date: Mon, 26 Oct 2026 22:15:55 -0400
-Subject: [PATCH 3/3] server: wait for system memory after unloading on Metal
+Subject: [PATCH] server: wait for system memory after unloading on Metal
 
 waitForVRAMRecovery returned at once for Metal and integrated GPUs.
 Those devices share system memory, and the scheduler checks system free
@@ -26,7 +26,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  2 files changed, 101 insertions(+), 22 deletions(-)
 
 diff --git a/server/sched.go b/server/sched.go
-index 32a231b..746623e 100644
+index 2c8d818d..8b3f61c1 100644
 --- a/server/sched.go
 +++ b/server/sched.go
 @@ -1482,26 +1482,40 @@ func (runner *runnerRef) needsReload(ctx context.Context, req *LlmRequest) bool
@@ -109,10 +109,10 @@ index 32a231b..746623e 100644
  					finished <- struct{}{}
  					return
 diff --git a/server/sched_test.go b/server/sched_test.go
-index 8d84ee0..ecedf86 100644
+index f5d7fab8..9c170abc 100644
 --- a/server/sched_test.go
 +++ b/server/sched_test.go
-@@ -2304,3 +2304,74 @@ func TestSchedulerTracksMultipleLoadedRunners(t *testing.T) {
+@@ -2302,3 +2302,74 @@ func TestSchedulerTracksMultipleLoadedRunners(t *testing.T) {
  	expectedFree := uint64(24*format.GigaByte) - uint64(8*format.GigaByte) - uint64(4*format.GigaByte)
  	require.Equal(t, expectedFree, gpus[0].FreeMemory)
  }
