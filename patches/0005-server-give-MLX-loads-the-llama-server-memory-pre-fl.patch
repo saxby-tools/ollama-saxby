@@ -1,0 +1,990 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Niko Lowry <niko@neeks.me>
+Date: Fri, 30 Oct 2026 19:08:01 -0400
+Subject: [PATCH] server: give MLX loads the llama-server memory pre-flight
+
+The scheduler predicts a llama-server load's memory, evicts when it
+does not fit beside the loaded models, and books the runner at that
+size. An MLX load got none of that: the client was booked at the
+manifest's tensor bytes, MemorySize reported whatever the runner held
+at the moment, and updateFreeSpace handed the difference to the next
+load. The KV cache then grew into memory the ledger had given away.
+
+On an M5 Max with 128 GiB, qwen3.8:27b (nvfp4, 262144 context) was
+booked at 16.9 GiB and three other runners were loaded beside it. Its
+runner logged a 44.5 GiB peak, reached 78.8 GiB resident, and the
+machine kernel-panicked on a watchdog timeout from memory thrash.
+
+mlxrunner now predicts a load from the manifest before the subprocess
+exists: the tensor bytes, the attention KV cache for the effective
+context (num_ctx capped at the model's length, per layer for hybrid
+and sliding-window architectures, from the config.json fields the
+architectures share), the fixed state of recurrent layers, and the
+8 GiB paged-out prefix cache budget. The scheduler runs the same
+evict-before-spawn check as for llama-server, with matching log lines,
+and the client books max(live, predicted) so the headroom stays
+reserved. For qwen3.8:27b the prediction is 41 GiB.
+
+The runner's compute buffers and MLX's allocator cache are still not
+counted, as for llama-server; the 20% headroom covers them.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ mlxrunner/client.go        |  32 ++--
+ mlxrunner/client_test.go   |  14 ++
+ mlxrunner/estimate.go      | 333 +++++++++++++++++++++++++++++++++++++
+ mlxrunner/estimate_test.go | 259 +++++++++++++++++++++++++++++
+ server/sched.go            |  69 +++++++-
+ server/sched_test.go       | 121 ++++++++++++++
+ 6 files changed, 815 insertions(+), 13 deletions(-)
+ create mode 100644 mlxrunner/estimate.go
+ create mode 100644 mlxrunner/estimate_test.go
+
+diff --git a/mlxrunner/client.go b/mlxrunner/client.go
+index 0d46c83..e8550f6 100644
+--- a/mlxrunner/client.go
++++ b/mlxrunner/client.go
+@@ -27,10 +27,8 @@ import (
+ 	"github.com/ollama/ollama/envconfig"
+ 	"github.com/ollama/ollama/format"
+ 	"github.com/ollama/ollama/llm"
+-	"github.com/ollama/ollama/manifest"
+ 	"github.com/ollama/ollama/ml"
+ 	"github.com/ollama/ollama/mlx"
+-	"github.com/ollama/ollama/types/model"
+ )
+ 
+ // Client wraps an MLX runner subprocess to implement llm.LlamaServer for LLM models.
+@@ -40,7 +38,8 @@ type Client struct {
+ 	contextLength       atomic.Int64
+ 	softContextLength   int // recommended limit to avoid poor performance
+ 	memory              atomic.Uint64
+-	embeddingDimensions atomic.Value // []int
++	predicted           MemoryEstimate // size once the caches fill; the booked floor
++	embeddingDimensions atomic.Value   // []int
+ 	done                chan struct{}
+ 	doneErr             error // valid after done is closed
+ 	client              *http.Client
+@@ -66,19 +65,22 @@ func NewClient(modelName string, softContextLength int) (*Client, error) {
+ 		client:            http.DefaultClient,
+ 	}
+ 
+-	modelManifest, err := manifest.ParseNamedManifest(model.ParseName(modelName))
++	estimate, err := PredictMemory(modelName, softContextLength)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+-	var tensorBytes int64
+-	for _, layer := range modelManifest.TensorLayers() {
+-		tensorBytes += layer.Size
+-	}
+-	c.memory.Store(uint64(tensorBytes))
++	c.predicted = estimate
++	c.memory.Store(estimate.Weights)
+ 
+ 	return c, nil
+ }
+ 
++// Predicted returns the memory the runner is expected to reach once its
++// caches have filled for the context it was created with.
++func (c *Client) Predicted() MemoryEstimate {
++	return c.predicted
++}
++
+ // CheckRuntime reports whether an MLX dynamic library was loaded successfully.
+ func CheckRuntime() error {
+ 	if _, err := mlx.LoadedLibraryPath(); err != nil {
+@@ -627,15 +629,23 @@ func (c *Client) currentMemory() uint64 {
+ 	return c.memory.Load()
+ }
+ 
++// booked is the memory the scheduler should hold for this runner. The
++// runner reports what it holds right now, which is the weights until the
++// caches fill, so the prediction is the floor; a runner that has grown past
++// it reports its real size.
++func (c *Client) booked(live uint64) uint64 {
++	return max(live, c.predicted.Total())
++}
++
+ // MemorySize implements llm.LlamaServer.
+ func (c *Client) MemorySize() (total, vram uint64) {
+-	mem := c.currentMemory()
++	mem := c.booked(c.currentMemory())
+ 	return mem, mem
+ }
+ 
+ // VRAMByGPU implements llm.LlamaServer.
+ func (c *Client) VRAMByGPU(id ml.DeviceID) uint64 {
+-	return c.currentMemory()
++	return c.booked(c.currentMemory())
+ }
+ 
+ var _ llm.LlamaServer = (*Client)(nil)
+diff --git a/mlxrunner/client_test.go b/mlxrunner/client_test.go
+index 0f231a6..d4459a8 100644
+--- a/mlxrunner/client_test.go
++++ b/mlxrunner/client_test.go
+@@ -47,3 +47,17 @@ func TestRequestGrammar(t *testing.T) {
+ 		})
+ 	}
+ }
++
++func TestClientBooksPredictedMemory(t *testing.T) {
++	c := &Client{predicted: MemoryEstimate{Weights: 16, KVCache: 8, PrefixCache: 4}}
++
++	// The runner holds only its weights until the caches fill.
++	if got := c.booked(16); got != 28 {
++		t.Errorf("booked(16) = %d, want the 28 predicted", got)
++	}
++
++	// A runner that has grown past the prediction reports its real size.
++	if got := c.booked(40); got != 40 {
++		t.Errorf("booked(40) = %d, want 40", got)
++	}
++}
+diff --git a/mlxrunner/estimate.go b/mlxrunner/estimate.go
+new file mode 100644
+index 0000000..f50124e
+--- /dev/null
++++ b/mlxrunner/estimate.go
+@@ -0,0 +1,333 @@
++package mlxrunner
++
++import (
++	"encoding/json"
++	"fmt"
++	"strings"
++
++	"github.com/ollama/ollama/manifest"
++	"github.com/ollama/ollama/types/model"
++)
++
++// MemoryEstimate is the memory an MLX runner is predicted to reach once its
++// caches have filled for the context it serves. The runner reports only what
++// it holds right now, which at load time is the weights; the scheduler books
++// the runner at this estimate instead so the cache has room to grow.
++type MemoryEstimate struct {
++	// Weights is the size of the tensor blobs in the manifest.
++	Weights uint64
++	// KVCache is the attention cache at NumCtx tokens.
++	KVCache uint64
++	// Recurrent is the fixed state of linear-attention and SSM layers.
++	Recurrent uint64
++	// PrefixCache is the budget for paged-out prefix snapshots.
++	PrefixCache uint64
++	// NumCtx is the context the cache terms were sized for.
++	NumCtx int
++}
++
++// Total is the memory to book for the runner.
++func (e MemoryEstimate) Total() uint64 {
++	return e.Weights + e.KVCache + e.Recurrent + e.PrefixCache
++}
++
++// kvConfig is the part of a safetensors config.json that sizes the caches.
++// Each architecture parses its own config in the runner process; these are
++// the fields they share, read here so the scheduler can size the caches
++// before the runner exists.
++type kvConfig struct {
++	HiddenSize            int    `json:"hidden_size"`
++	NumHiddenLayers       int    `json:"num_hidden_layers"`
++	NumAttentionHeads     int    `json:"num_attention_heads"`
++	NumKeyValueHeads      int    `json:"num_key_value_heads"`
++	HeadDim               int    `json:"head_dim"`
++	GlobalHeadDim         int    `json:"global_head_dim"`
++	MaxPositionEmbeddings int    `json:"max_position_embeddings"`
++	TorchDtype            string `json:"torch_dtype"`
++	Dtype                 string `json:"dtype"`
++
++	// Layer layout of hybrid and sliding-window architectures.
++	LayerTypes            []string `json:"layer_types"`
++	LayersBlockType       []string `json:"layers_block_type"`
++	HybridOverridePattern string   `json:"hybrid_override_pattern"`
++	FullAttentionInterval int      `json:"full_attention_interval"`
++	SlidingWindow         int      `json:"sliding_window"`
++	SlidingWindowPattern  int      `json:"sliding_window_pattern"`
++	NumKVSharedLayers     int      `json:"num_kv_shared_layers"`
++
++	// Gated delta-net state (qwen3_5, qwen4_exp).
++	LinearNumValueHeads int `json:"linear_num_value_heads"`
++	LinearNumKeyHeads   int `json:"linear_num_key_heads"`
++	LinearKeyHeadDim    int `json:"linear_key_head_dim"`
++	LinearValueHeadDim  int `json:"linear_value_head_dim"`
++	LinearConvKernelDim int `json:"linear_conv_kernel_dim"`
++
++	// Mamba state (nemotron_h).
++	ConvKernel    int `json:"conv_kernel"`
++	SSMStateSize  int `json:"ssm_state_size"`
++	MambaNumHeads int `json:"mamba_num_heads"`
++	MambaHeadDim  int `json:"mamba_head_dim"`
++	NGroups       int `json:"n_groups"`
++
++	// Short convolution state (lfm3).
++	ConvLCache int `json:"conv_L_cache"`
++
++	// Multi-head latent attention (glm4_moe_lite): the cache holds the
++	// compressed KV and the rope keys as one head.
++	KVLoraRank    int `json:"kv_lora_rank"`
++	QKRopeHeadDim int `json:"qk_rope_head_dim"`
++}
++
++type layerKind int
++
++const (
++	layerNoCache layerKind = iota
++	layerFullAttention
++	layerSlidingAttention
++	layerRecurrent
++)
++
++// PredictMemory estimates the memory the MLX runner for modelName reaches
++// serving numCtx tokens of context. numCtx is capped at the model's own
++// context length, as the runner caps it; zero means the model's length.
++func PredictMemory(modelName string, numCtx int) (MemoryEstimate, error) {
++	m, err := manifest.ParseNamedManifest(model.ParseName(modelName))
++	if err != nil {
++		return MemoryEstimate{}, err
++	}
++
++	configData, err := m.ReadConfig("config.json")
++	if err != nil {
++		return MemoryEstimate{}, err
++	}
++
++	return predictMemory(m, configData, numCtx)
++}
++
++func predictMemory(m *manifest.Manifest, configData []byte, numCtx int) (MemoryEstimate, error) {
++	cfg, err := parseKVConfig(configData)
++	if err != nil {
++		return MemoryEstimate{}, err
++	}
++
++	var estimate MemoryEstimate
++	for _, layer := range m.TensorLayers() {
++		estimate.Weights += uint64(layer.Size)
++	}
++
++	estimate.NumCtx = numCtx
++	if cfg.MaxPositionEmbeddings > 0 && (numCtx <= 0 || numCtx > cfg.MaxPositionEmbeddings) {
++		estimate.NumCtx = cfg.MaxPositionEmbeddings
++	}
++
++	for _, kind := range cfg.layerKinds() {
++		switch kind {
++		case layerFullAttention:
++			estimate.KVCache += cfg.attentionBytes(estimate.NumCtx, cfg.fullHeadDim())
++		case layerSlidingAttention:
++			estimate.KVCache += cfg.attentionBytes(min(estimate.NumCtx, cfg.SlidingWindow), cfg.headDim())
++		case layerRecurrent:
++			estimate.Recurrent += cfg.recurrentBytes()
++		}
++	}
++
++	// Paged-out prefix snapshots are copies of cache state, so a model
++	// without caches has nothing to page out.
++	if estimate.KVCache+estimate.Recurrent > 0 {
++		estimate.PrefixCache = uint64(maxPagedOutBytes)
++	}
++
++	return estimate, nil
++}
++
++// parseKVConfig reads the text model's fields. Multimodal checkpoints nest
++// them under text_config (or llm_config), where they take precedence over
++// the top level.
++func parseKVConfig(configData []byte) (kvConfig, error) {
++	var cfg kvConfig
++	if err := json.Unmarshal(configData, &cfg); err != nil {
++		return kvConfig{}, fmt.Errorf("parse config.json: %w", err)
++	}
++
++	var nested struct {
++		TextConfig json.RawMessage `json:"text_config"`
++		LLMConfig  json.RawMessage `json:"llm_config"`
++	}
++	if err := json.Unmarshal(configData, &nested); err != nil {
++		return kvConfig{}, fmt.Errorf("parse config.json: %w", err)
++	}
++
++	for _, raw := range [][]byte{nested.TextConfig, nested.LLMConfig} {
++		if len(raw) == 0 || string(raw) == "null" {
++			continue
++		}
++		if err := json.Unmarshal(raw, &cfg); err != nil {
++			return kvConfig{}, fmt.Errorf("parse nested text config: %w", err)
++		}
++	}
++
++	return cfg, nil
++}
++
++// layerKinds returns what each layer caches, following the rules the
++// architectures use to pick a cache per layer: an explicit per-layer list
++// first, then a repeating pattern, and plain full attention otherwise.
++func (cfg *kvConfig) layerKinds() []layerKind {
++	kinds := make([]layerKind, cfg.NumHiddenLayers)
++	for i := range kinds {
++		kinds[i] = cfg.layerKind(i)
++	}
++
++	// Gemma 4's last num_kv_shared_layers layers reuse an earlier layer's
++	// cache and allocate none of their own.
++	if len(cfg.LayerTypes) > 0 {
++		for i := cfg.NumHiddenLayers - cfg.NumKVSharedLayers; i >= 0 && i < len(kinds); i++ {
++			kinds[i] = layerNoCache
++		}
++	}
++
++	return kinds
++}
++
++func (cfg *kvConfig) layerKind(i int) layerKind {
++	if len(cfg.LayerTypes) == cfg.NumHiddenLayers {
++		return layerKindFromName(cfg.LayerTypes[i])
++	}
++
++	if len(cfg.LayersBlockType) == cfg.NumHiddenLayers {
++		return layerKindFromName(cfg.LayersBlockType[i])
++	}
++
++	if len(cfg.HybridOverridePattern) == cfg.NumHiddenLayers {
++		return layerKindFromPattern(cfg.HybridOverridePattern[i])
++	}
++
++	if cfg.FullAttentionInterval > 0 {
++		if (i+1)%cfg.FullAttentionInterval == 0 {
++			return layerFullAttention
++		}
++		return layerRecurrent
++	}
++
++	if cfg.SlidingWindow > 0 && cfg.SlidingWindowPattern > 0 {
++		if (i+1)%cfg.SlidingWindowPattern == 0 {
++			return layerFullAttention
++		}
++		return layerSlidingAttention
++	}
++
++	return layerFullAttention
++}
++
++// layerKindFromName maps a layer_types or layers_block_type entry. Names
++// vary by family (full_attention, attention, linear_attention, mamba,
++// conv, sliding_attention, mlp, moe); an unknown name is sized as full
++// attention, the largest cache.
++func layerKindFromName(name string) layerKind {
++	name = strings.ToLower(name)
++	switch {
++	case strings.Contains(name, "sliding"):
++		return layerSlidingAttention
++	case strings.Contains(name, "linear"), strings.Contains(name, "mamba"),
++		strings.Contains(name, "conv"), strings.Contains(name, "recurrent"):
++		return layerRecurrent
++	case name == "mlp", name == "moe":
++		return layerNoCache
++	default:
++		return layerFullAttention
++	}
++}
++
++// layerKindFromPattern maps a hybrid_override_pattern character: M is
++// Mamba, * and A are attention, - and E are MLP or MoE blocks.
++func layerKindFromPattern(c byte) layerKind {
++	switch c {
++	case 'M':
++		return layerRecurrent
++	case '*', 'A':
++		return layerFullAttention
++	default:
++		return layerNoCache
++	}
++}
++
++func (cfg *kvConfig) headDim() int {
++	if cfg.HeadDim > 0 {
++		return cfg.HeadDim
++	}
++	if cfg.NumAttentionHeads > 0 {
++		return cfg.HiddenSize / cfg.NumAttentionHeads
++	}
++	return 0
++}
++
++// fullHeadDim is the head size of full-attention layers, which Gemma 4 sets
++// apart from its sliding layers.
++func (cfg *kvConfig) fullHeadDim() int {
++	if cfg.GlobalHeadDim > 0 {
++		return cfg.GlobalHeadDim
++	}
++	return cfg.headDim()
++}
++
++func (cfg *kvConfig) kvHeads() int {
++	if cfg.NumKeyValueHeads > 0 {
++		return cfg.NumKeyValueHeads
++	}
++	return cfg.NumAttentionHeads
++}
++
++// elementSize is the size of a cache element. The caches take the
++// activation dtype, which is the checkpoint's dtype; MLX runs these models
++// in 16-bit unless the checkpoint is float32.
++func (cfg *kvConfig) elementSize() uint64 {
++	dtype := cfg.Dtype
++	if dtype == "" {
++		dtype = cfg.TorchDtype
++	}
++	if strings.EqualFold(dtype, "float32") {
++		return 4
++	}
++	return 2
++}
++
++// attentionBytes is one layer's keys and values for tokens of context.
++func (cfg *kvConfig) attentionBytes(tokens, headDim int) uint64 {
++	if tokens <= 0 {
++		return 0
++	}
++
++	// MLA keeps a single compressed head holding the latent KV and the
++	// rope keys; the values are a view of the same tensor.
++	if cfg.KVLoraRank > 0 {
++		return uint64(tokens) * uint64(cfg.KVLoraRank+cfg.QKRopeHeadDim) * cfg.elementSize()
++	}
++
++	perToken := uint64(2) * uint64(cfg.kvHeads()) * uint64(headDim) * cfg.elementSize()
++	return uint64(tokens) * perToken
++}
++
++// recurrentBytes is one layer's fixed state: a convolution tail in the
++// activation dtype and a float32 recurrent state, mirroring
++// cache.NewRecurrentCache's arguments in each architecture.
++func (cfg *kvConfig) recurrentBytes() uint64 {
++	var convTail, convDim, stateElems int
++	switch {
++	case cfg.LinearConvKernelDim > 0:
++		convTail = cfg.LinearConvKernelDim - 1
++		convDim = 2*cfg.LinearNumKeyHeads*cfg.LinearKeyHeadDim + cfg.LinearNumValueHeads*cfg.LinearValueHeadDim
++		stateElems = cfg.LinearNumValueHeads * cfg.LinearValueHeadDim * cfg.LinearKeyHeadDim
++	case cfg.ConvKernel > 0:
++		convTail = cfg.ConvKernel - 1
++		convDim = cfg.MambaNumHeads*cfg.MambaHeadDim + 2*cfg.NGroups*cfg.SSMStateSize
++		stateElems = cfg.MambaNumHeads * cfg.MambaHeadDim * cfg.SSMStateSize
++	case cfg.ConvLCache > 0:
++		convTail = cfg.ConvLCache - 1
++		convDim = cfg.HiddenSize
++		stateElems = 1
++	default:
++		return 0
++	}
++
++	return uint64(convTail)*uint64(convDim)*cfg.elementSize() + uint64(stateElems)*4
++}
+diff --git a/mlxrunner/estimate_test.go b/mlxrunner/estimate_test.go
+new file mode 100644
+index 0000000..d73e4cc
+--- /dev/null
++++ b/mlxrunner/estimate_test.go
+@@ -0,0 +1,259 @@
++package mlxrunner
++
++import (
++	"testing"
++
++	"github.com/ollama/ollama/manifest"
++)
++
++func testManifest(tensorSizes ...int64) *manifest.Manifest {
++	m := &manifest.Manifest{}
++	for _, size := range tensorSizes {
++		m.Layers = append(m.Layers, manifest.Layer{MediaType: manifest.MediaTypeImageTensor, Size: size})
++	}
++	m.Layers = append(m.Layers, manifest.Layer{MediaType: "application/vnd.ollama.image.json", Name: "config.json", Size: 1})
++	return m
++}
++
++// qwen3_5 27B: 64 layers, every fourth one full attention, the rest gated
++// delta-net, config nested under text_config as the multimodal checkpoint
++// ships it.
++const qwen3_5Config = `{
++	"architectures": ["Qwen3_5ForConditionalGeneration"],
++	"model_type": "qwen3_5",
++	"text_config": {
++		"dtype": "bfloat16",
++		"hidden_size": 5120,
++		"num_hidden_layers": 64,
++		"num_attention_heads": 24,
++		"num_key_value_heads": 4,
++		"head_dim": 256,
++		"max_position_embeddings": 262144,
++		"full_attention_interval": 4,
++		"linear_num_value_heads": 48,
++		"linear_num_key_heads": 16,
++		"linear_key_head_dim": 128,
++		"linear_value_head_dim": 128,
++		"linear_conv_kernel_dim": 4
++	},
++	"vision_config": {"num_hidden_layers": 27, "hidden_size": 1152}
++}`
++
++func TestPredictMemoryHybrid(t *testing.T) {
++	m := testManifest(10<<30, 6<<30)
++	got, err := predictMemory(m, []byte(qwen3_5Config), 262144)
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	// 16 full-attention layers, each 2 (K and V) * 4 heads * 256 * 2 bytes
++	// = 4 KiB per token, so 64 KiB per token over 262144 tokens.
++	const kv = 16 * 2 * 4 * 256 * 2 * 262144
++
++	// 48 recurrent layers, each a bf16 conv tail of 3 x (2*16*128 +
++	// 48*128) plus a float32 state of 48 x 128 x 128.
++	const recurrent = 48 * (3*(2*16*128+48*128)*2 + 48*128*128*4)
++
++	want := MemoryEstimate{
++		Weights:     16 << 30,
++		KVCache:     kv,
++		Recurrent:   recurrent,
++		PrefixCache: 8 << 30,
++		NumCtx:      262144,
++	}
++	if got != want {
++		t.Errorf("predictMemory = %+v, want %+v", got, want)
++	}
++	if got.Total() != want.Weights+kv+recurrent+8<<30 {
++		t.Errorf("Total = %d", got.Total())
++	}
++}
++
++func TestPredictMemoryLayerTypesWin(t *testing.T) {
++	// An explicit layer_types list overrides the interval, here making
++	// two of four layers full attention instead of one.
++	config := `{
++		"num_hidden_layers": 4,
++		"num_attention_heads": 8,
++		"num_key_value_heads": 2,
++		"head_dim": 64,
++		"full_attention_interval": 4,
++		"layer_types": ["linear_attention", "full_attention", "linear_attention", "full_attention"],
++		"linear_conv_kernel_dim": 4,
++		"linear_num_key_heads": 1,
++		"linear_key_head_dim": 8,
++		"linear_num_value_heads": 1,
++		"linear_value_head_dim": 8
++	}`
++	got, err := predictMemory(testManifest(1), []byte(config), 1024)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if want := uint64(2 * 2 * 2 * 64 * 2 * 1024); got.KVCache != want {
++		t.Errorf("KVCache = %d, want %d", got.KVCache, want)
++	}
++	if want := uint64(2 * (3*(2*8+8)*2 + 8*8*4)); got.Recurrent != want {
++		t.Errorf("Recurrent = %d, want %d", got.Recurrent, want)
++	}
++}
++
++func TestPredictMemoryContextCappedAtModel(t *testing.T) {
++	config := `{
++		"num_hidden_layers": 2,
++		"num_attention_heads": 4,
++		"num_key_value_heads": 4,
++		"hidden_size": 256,
++		"max_position_embeddings": 4096
++	}`
++	for _, tt := range []struct {
++		name   string
++		numCtx int
++		want   int
++	}{
++		{"below the model's length", 1024, 1024},
++		{"above the model's length", 262144, 4096},
++		{"unset", 0, 4096},
++	} {
++		t.Run(tt.name, func(t *testing.T) {
++			got, err := predictMemory(testManifest(1), []byte(config), tt.numCtx)
++			if err != nil {
++				t.Fatal(err)
++			}
++			if got.NumCtx != tt.want {
++				t.Errorf("NumCtx = %d, want %d", got.NumCtx, tt.want)
++			}
++			// head_dim defaults to hidden_size / heads = 64.
++			if want := uint64(2 * 2 * 4 * 64 * 2 * tt.want); got.KVCache != want {
++				t.Errorf("KVCache = %d, want %d", got.KVCache, want)
++			}
++		})
++	}
++}
++
++func TestPredictMemorySlidingWindowAndSharedKV(t *testing.T) {
++	// Gemma 4 style: sliding layers hold the window, full layers use
++	// global_head_dim, and the last num_kv_shared_layers allocate nothing.
++	config := `{
++		"text_config": {
++			"num_hidden_layers": 6,
++			"num_attention_heads": 8,
++			"num_key_value_heads": 2,
++			"head_dim": 256,
++			"global_head_dim": 512,
++			"sliding_window": 512,
++			"num_kv_shared_layers": 2,
++			"layer_types": ["sliding_attention", "sliding_attention", "full_attention",
++				"sliding_attention", "sliding_attention", "full_attention"]
++		}
++	}`
++	got, err := predictMemory(testManifest(1), []byte(config), 8192)
++	if err != nil {
++		t.Fatal(err)
++	}
++	sliding := uint64(2 * 2 * 256 * 2 * 512)
++	full := uint64(2 * 2 * 512 * 2 * 8192)
++	if want := 3*sliding + full; got.KVCache != want {
++		t.Errorf("KVCache = %d, want %d", got.KVCache, want)
++	}
++}
++
++func TestPredictMemorySlidingWindowPattern(t *testing.T) {
++	// Without layer_types, Gemma 4 makes every fifth layer full attention.
++	config := `{
++		"num_hidden_layers": 5,
++		"num_attention_heads": 8,
++		"num_key_value_heads": 1,
++		"head_dim": 256,
++		"sliding_window": 1024,
++		"sliding_window_pattern": 5
++	}`
++	got, err := predictMemory(testManifest(1), []byte(config), 4096)
++	if err != nil {
++		t.Fatal(err)
++	}
++	sliding := uint64(2 * 1 * 256 * 2 * 1024)
++	full := uint64(2 * 1 * 256 * 2 * 4096)
++	if want := 4*sliding + full; got.KVCache != want {
++		t.Errorf("KVCache = %d, want %d", got.KVCache, want)
++	}
++}
++
++func TestPredictMemoryHybridOverridePattern(t *testing.T) {
++	// Nemotron-H: M is Mamba, * is attention, - is an MLP block.
++	config := `{
++		"llm_config": {
++			"num_hidden_layers": 6,
++			"hybrid_override_pattern": "M*M-M*",
++			"num_attention_heads": 8,
++			"num_key_value_heads": 2,
++			"head_dim": 128,
++			"conv_kernel": 4,
++			"ssm_state_size": 128,
++			"mamba_num_heads": 64,
++			"mamba_head_dim": 64,
++			"n_groups": 8
++		}
++	}`
++	got, err := predictMemory(testManifest(1), []byte(config), 2048)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if want := uint64(2 * 2 * 2 * 128 * 2 * 2048); got.KVCache != want {
++		t.Errorf("KVCache = %d, want %d", got.KVCache, want)
++	}
++	convDim := 64*64 + 2*8*128
++	if want := uint64(3 * (3*convDim*2 + 64*64*128*4)); got.Recurrent != want {
++		t.Errorf("Recurrent = %d, want %d", got.Recurrent, want)
++	}
++}
++
++func TestPredictMemoryMLA(t *testing.T) {
++	config := `{
++		"num_hidden_layers": 2,
++		"num_attention_heads": 16,
++		"kv_lora_rank": 512,
++		"qk_rope_head_dim": 64,
++		"torch_dtype": "bfloat16"
++	}`
++	got, err := predictMemory(testManifest(1), []byte(config), 1000)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if want := uint64(2 * (512 + 64) * 2 * 1000); got.KVCache != want {
++		t.Errorf("KVCache = %d, want %d", got.KVCache, want)
++	}
++}
++
++func TestPredictMemoryFloat32(t *testing.T) {
++	config := `{
++		"num_hidden_layers": 1,
++		"num_attention_heads": 1,
++		"head_dim": 8,
++		"torch_dtype": "float32"
++	}`
++	got, err := predictMemory(testManifest(1), []byte(config), 10)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if want := uint64(2 * 1 * 8 * 4 * 10); got.KVCache != want {
++		t.Errorf("KVCache = %d, want %d", got.KVCache, want)
++	}
++}
++
++func TestPredictMemoryWithoutCaches(t *testing.T) {
++	// A config without layers describes no cache, so there is nothing to
++	// page out either: the estimate is the weights.
++	got, err := predictMemory(testManifest(100, 200), []byte(`{"model_type": "other"}`), 4096)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if want := (MemoryEstimate{Weights: 300, NumCtx: 4096}); got != want {
++		t.Errorf("predictMemory = %+v, want %+v", got, want)
++	}
++}
++
++func TestPredictMemoryBadConfig(t *testing.T) {
++	if _, err := predictMemory(testManifest(1), []byte(`{"num_hidden_layers": "many"}`), 10); err == nil {
++		t.Error("expected an error for a malformed config")
++	}
++}
+diff --git a/server/sched.go b/server/sched.go
+index 2474c72..94b0ff7 100644
+--- a/server/sched.go
++++ b/server/sched.go
+@@ -78,11 +78,28 @@ type Scheduler struct {
+ 
+ 	loadFn          func(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.DeviceInfo, requireFull bool) bool
+ 	newServerFn     func(systemInfo ml.SystemInfo, gpus []ml.DeviceInfo, model string, f *gguf.Model, adapters []string, projectors []string, opts api.Options, numParallel int, config llm.LlamaServerConfig) (llm.LlamaServer, error)
++	newMLXServerFn  func(modelName string, numCtx int) (mlxServer, error)
+ 	getGpuFn        func(ctx context.Context, runners []ml.FilteredRunnerDiscovery) []ml.DeviceInfo
+ 	getSystemInfoFn func() ml.SystemInfo
+ 	waitForRecovery time.Duration
+ }
+ 
++// mlxServer is an MLX runner client. It predicts its memory from the
++// manifest before the subprocess exists, which is when the scheduler has to
++// decide whether to evict.
++type mlxServer interface {
++	llm.LlamaServer
++	Predicted() mlxrunner.MemoryEstimate
++}
++
++func newMLXServer(modelName string, numCtx int) (mlxServer, error) {
++	client, err := mlxrunner.NewClient(modelName, numCtx)
++	if err != nil {
++		return nil, err
++	}
++	return client, nil
++}
++
+ // loadedModelsForName returns models still owned by loaded runners. The models
+ // are read-only after resolution, so callers may use them after releasing
+ // loadedMu even if a runner unloads in the meantime.
+@@ -131,6 +148,7 @@ func InitScheduler(ctx context.Context) *Scheduler {
+ 		unloadedCh:      make(chan any, maxQueue),
+ 		loaded:          make(map[string]*runnerRef),
+ 		newServerFn:     llm.NewLlamaServer,
++		newMLXServerFn:  newMLXServer,
+ 		getGpuFn:        discover.GPUDevices,
+ 		getSystemInfoFn: discover.GetSystemInfo,
+ 		waitForRecovery: 5 * time.Second,
+@@ -629,8 +647,19 @@ func (s *Scheduler) load(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.De
+ 				}
+ 			}
+ 		} else {
+-			modelName := req.model.ShortName
+-			llama, err = mlxrunner.NewClient(modelName, req.opts.NumCtx)
++			var mlx mlxServer
++			mlx, err = s.newMLXServerFn(req.model.ShortName, req.opts.NumCtx)
++			if err == nil {
++				// Pre-flight check: the runner reports only what it holds, which
++				// at load time is the weights, so without a prediction the cache
++				// grows into memory the ledger has given to other models. Nothing
++				// has been spawned yet, so evicting here closes nothing.
++				if requireFull && len(s.loaded) > 0 && len(gpus) > 0 && !s.mlxFits(mlx.Predicted(), systemInfo, gpus) {
++					s.loadedMu.Unlock()
++					return true
++				}
++				llama = mlx
++			}
+ 		}
+ 		if err != nil {
+ 			slog.Info("failed to create server", "model", req.model.ShortName, "error", err)
+@@ -844,6 +873,42 @@ func explicitPartialGPUOffload(opts api.Options, f *gguf.Model) bool {
+ 	return uint64(opts.NumGPU) < f.KV().BlockCount()+1
+ }
+ 
++// mlxFits reports whether an MLX runner predicted to reach estimate fits
++// beside the loaded models, with the same 80% headroom llama-server loads
++// keep. MLX uses the first GPU only.
++func (s *Scheduler) mlxFits(estimate mlxrunner.MemoryEstimate, systemInfo ml.SystemInfo, gpus []ml.DeviceInfo) bool {
++	freeMemory, gpuFreeMemory, systemLimited := availableMemoryForLoad(systemInfo, gpus[:1])
++	predicted := estimate.Total()
++
++	if predicted > freeMemory*80/100 {
++		slog.Info("mlx model predicted to exceed available memory, evicting",
++			"predicted", format.HumanBytes2(predicted),
++			"predicted_num_ctx", estimate.NumCtx,
++			"weights", format.HumanBytes2(estimate.Weights),
++			"kv_cache", format.HumanBytes2(estimate.KVCache),
++			"recurrent", format.HumanBytes2(estimate.Recurrent),
++			"prefix_cache", format.HumanBytes2(estimate.PrefixCache),
++			"available", format.HumanBytes2(freeMemory),
++			"gpu_free", format.HumanBytes2(gpuFreeMemory),
++			"system_free", format.HumanBytes2(systemInfo.FreeMemory),
++			"system_limited", systemLimited)
++		return false
++	}
++
++	slog.Info("mlx model fits alongside existing models",
++		"predicted", format.HumanBytes2(predicted),
++		"predicted_num_ctx", estimate.NumCtx,
++		"weights", format.HumanBytes2(estimate.Weights),
++		"kv_cache", format.HumanBytes2(estimate.KVCache),
++		"recurrent", format.HumanBytes2(estimate.Recurrent),
++		"prefix_cache", format.HumanBytes2(estimate.PrefixCache),
++		"available", format.HumanBytes2(freeMemory),
++		"gpu_free", format.HumanBytes2(gpuFreeMemory),
++		"system_free", format.HumanBytes2(systemInfo.FreeMemory),
++		"system_limited", systemLimited)
++	return true
++}
++
+ func effectiveLlamaServerContext(numCtx int, f *gguf.Model, numParallel int) int {
+ 	return effectiveModelContext(numCtx, f) * max(numParallel, 1)
+ }
+diff --git a/server/sched_test.go b/server/sched_test.go
+index ecedf86..83ed9db 100644
+--- a/server/sched_test.go
++++ b/server/sched_test.go
+@@ -20,6 +20,7 @@ import (
+ 	gguftest "github.com/ollama/ollama/internal/testutil/gguf"
+ 	"github.com/ollama/ollama/llm"
+ 	"github.com/ollama/ollama/ml"
++	"github.com/ollama/ollama/mlxrunner"
+ 	"github.com/ollama/ollama/types/model"
+ )
+ 
+@@ -2375,3 +2376,123 @@ func TestWaitForVRAMRecoverySharedMemory(t *testing.T) {
+ 		}
+ 	})
+ }
++
++// mockMLX stands in for an MLX runner client: it never spawns a process and
++// carries the prediction the scheduler checks before loading.
++type mockMLX struct {
++	mockLlm
++	predicted mlxrunner.MemoryEstimate
++}
++
++func (m *mockMLX) Predicted() mlxrunner.MemoryEstimate { return m.predicted }
++
++func newMLXRequest(ctx context.Context, name string) *LlmRequest {
++	m := &Model{
++		Name:      name,
++		ShortName: name,
++		Config:    model.ConfigV2{ModelFormat: "safetensors", Capabilities: []string{"completion"}},
++	}
++	return &LlmRequest{
++		ctx:             ctx,
++		model:           m,
++		opts:            api.DefaultOptions(),
++		sessionDuration: &api.Duration{Duration: 5 * time.Millisecond},
++		successCh:       make(chan *runnerRef, 1),
++		errCh:           make(chan error, 1),
++	}
++}
++
++// mlxScheduler has a 24 GiB Metal GPU with 20 GiB free and one model loaded,
++// and hands out MLX clients predicted to reach predicted bytes.
++func mlxScheduler(ctx context.Context, predicted uint64) (*Scheduler, *mockMLX) {
++	s := InitScheduler(ctx)
++	s.waitForRecovery = 10 * time.Millisecond
++	s.getGpuFn = func(ctx context.Context, runners []ml.FilteredRunnerDiscovery) []ml.DeviceInfo {
++		g := ml.DeviceInfo{DeviceID: ml.DeviceID{Library: "Metal"}, Integrated: true}
++		g.TotalMemory = 24 * format.GibiByte
++		g.FreeMemory = 20 * format.GibiByte
++		return []ml.DeviceInfo{g}
++	}
++	s.getSystemInfoFn = func() ml.SystemInfo {
++		return ml.SystemInfo{TotalMemory: 24 * format.GibiByte, FreeMemory: 20 * format.GibiByte}
++	}
++
++	s.loadedMu.Lock()
++	s.loaded["existing-model"] = &runnerRef{
++		llama:    &mockLlm{modelPath: "existing"},
++		modelKey: "existing-model",
++	}
++	s.loadedMu.Unlock()
++
++	mlx := &mockMLX{
++		mockLlm:   mockLlm{modelPath: "mlx-model", vramSize: 1 * format.GibiByte},
++		predicted: mlxrunner.MemoryEstimate{Weights: predicted / 2, KVCache: predicted / 2, NumCtx: 4096},
++	}
++	s.newMLXServerFn = func(modelName string, numCtx int) (mlxServer, error) {
++		mlx.contextLength = numCtx
++		return mlx, nil
++	}
++	return s, mlx
++}
++
++func TestSchedMLXEvictsWhenPredictedExceedsAvailable(t *testing.T) {
++	// 17 GiB predicted against 20 GiB free is over the 80% threshold.
++	ctx, done := context.WithTimeout(t.Context(), 500*time.Millisecond)
++	defer done()
++	s, mlx := mlxScheduler(ctx, 17*format.GibiByte)
++	req := newMLXRequest(ctx, "mlx-model")
++
++	needEvict := s.load(req, s.getSystemInfoFn(), s.getGpuFn(ctx, nil), true)
++	require.True(t, needEvict, "expected eviction when the predicted MLX size exceeds available memory")
++	require.Equal(t, req.opts.NumCtx, mlx.contextLength, "client should be created for the requested context")
++	require.False(t, mlx.closeCalled.Load(), "nothing was spawned, so nothing should be closed")
++	s.loadedMu.Lock()
++	require.Nil(t, s.activeLoading)
++	require.Len(t, s.loaded, 1, "the MLX model must not be registered")
++	s.loadedMu.Unlock()
++}
++
++func TestSchedMLXFitsAlongside(t *testing.T) {
++	// 10 GiB predicted against 20 GiB free loads without evicting.
++	ctx, done := context.WithTimeout(t.Context(), 500*time.Millisecond)
++	defer done()
++	s, mlx := mlxScheduler(ctx, 10*format.GibiByte)
++	req := newMLXRequest(ctx, "mlx-model")
++
++	needEvict := s.load(req, s.getSystemInfoFn(), s.getGpuFn(ctx, nil), true)
++	require.False(t, needEvict, "expected no eviction when the predicted MLX size fits")
++	s.loadedMu.Lock()
++	require.Len(t, s.loaded, 2)
++	require.Same(t, mlx, s.loaded[schedulerModelKey(req.model)].llama)
++	s.loadedMu.Unlock()
++}
++
++func TestSchedMLXFirstLoadSkipsFitCheck(t *testing.T) {
++	// With nothing else loaded there is nothing to evict, so the model loads
++	// however large the prediction is; the runner's own Load checks the
++	// weights fit.
++	ctx, done := context.WithTimeout(t.Context(), 500*time.Millisecond)
++	defer done()
++	s, _ := mlxScheduler(ctx, 100*format.GibiByte)
++	s.loadedMu.Lock()
++	delete(s.loaded, "existing-model")
++	s.loadedMu.Unlock()
++	req := newMLXRequest(ctx, "mlx-model")
++
++	needEvict := s.load(req, s.getSystemInfoFn(), s.getGpuFn(ctx, nil), false)
++	require.False(t, needEvict)
++	s.loadedMu.Lock()
++	require.Len(t, s.loaded, 1)
++	s.loadedMu.Unlock()
++}
++
++func TestSchedMLXFitsUsesSystemMemoryOnSharedGPU(t *testing.T) {
++	// On an integrated GPU the live system free memory is the tighter
++	// measurement, so the fit is judged against it.
++	s := &Scheduler{}
++	gpus := []ml.DeviceInfo{{DeviceID: ml.DeviceID{Library: "Metal"}, Integrated: true, TotalMemory: 128 * format.GibiByte, FreeMemory: 90 * format.GibiByte}}
++	estimate := mlxrunner.MemoryEstimate{Weights: 17 * format.GibiByte, KVCache: 16 * format.GibiByte, PrefixCache: 8 * format.GibiByte, NumCtx: 262144}
++
++	require.True(t, s.mlxFits(estimate, ml.SystemInfo{FreeMemory: 90 * format.GibiByte}, gpus))
++	require.False(t, s.mlxFits(estimate, ml.SystemInfo{FreeMemory: 50 * format.GibiByte}, gpus))
++}
