@@ -23,8 +23,10 @@ releases it.
 
 Needs git, Go, CMake, a C/C++ compiler, and Ninja if you have it. On
 macOS, the MLX engine also needs Xcode and its Metal Toolchain
-(`xcodebuild -downloadComponent MetalToolchain`); without it the build
-skips MLX and says so.
+(`xcodebuild -downloadComponent MetalToolchain`). Without it the build
+stops and says so, since a build without MLX cannot load safetensors
+models; pass `--no-mlx` if that is what you want. An Xcode update
+removes the toolchain, so expect to download it again after one.
 
 ```bash
 ./build.sh

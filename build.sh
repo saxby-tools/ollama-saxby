@@ -39,6 +39,7 @@ SCRATCH_EMAIL="$PKGNAME@localhost"
 EXIT_USAGE=64
 EXIT_CONFLICT=2
 EXIT_TESTS=3
+EXIT_TOOLCHAIN=4
 
 # ---------------------------------------------------------
 # OPTIONS
@@ -271,19 +272,29 @@ build() {
     if [ "$(uname -s)" = "Darwin" ]; then
         use_xcode
 
+        # Fail rather than quietly build less: a build that silently
+        # drops MLX cannot load safetensors models, and `current` would
+        # move to it. An Xcode update also removes the toolchain.
         if [ "$NO_MLX" -eq 0 ] && ! has_metal_toolchain; then
-            log "No Metal Toolchain; building without MLX."
-            log "Install it with: xcodebuild -downloadComponent MetalToolchain"
-            NO_MLX=1
+            fail "no Metal Toolchain, so MLX cannot be built. Install it \
+with 'xcodebuild -downloadComponent MetalToolchain', or pass --no-mlx." \
+                "$EXIT_TOOLCHAIN"
         fi
     fi
 
+    # The build folder is reused across runs and CMake caches these two,
+    # so an option absent this run must be unset or the last run's value
+    # silently applies.
     if [ "$NO_MLX" -eq 1 ]; then
         args="$args -DOLLAMA_MLX_BACKENDS="
+    else
+        args="$args -UOLLAMA_MLX_BACKENDS"
     fi
 
     if [ -n "$BACKENDS" ]; then
         args="$args -DOLLAMA_LLAMA_BACKENDS=$BACKENDS"
+    else
+        args="$args -UOLLAMA_LLAMA_BACKENDS"
     fi
 
     log "Building Ollama $TAG"
@@ -331,12 +342,10 @@ package() {
     local dest
     dest="$TAG-p$(patch_set_id)"
 
-    if [ -d "$PREFIX/$dest" ]; then
-        log "Already installed: $PREFIX/$dest"
-    else
-        log "Installing to $PREFIX/$dest"
-        cmake --install "$SRC/build" --prefix "$PREFIX/$dest" >/dev/null
-    fi
+    # Always install: the folder name says nothing about which engines
+    # were built, so an earlier build there may be a lesser one.
+    log "Installing to $PREFIX/$dest"
+    cmake --install "$SRC/build" --prefix "$PREFIX/$dest" >/dev/null
 
     ln -sfn "$dest" "$PREFIX/current"
     print_next_steps
