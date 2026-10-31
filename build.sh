@@ -201,6 +201,28 @@ write_summary() {
     } >>"$summary"
 }
 
+# Each patch names the upstream PR it rides on, as an Ollama-PR
+# trailer in its commit message. The file name carries that number
+# too, so a set that is not one patch per PR shows it at a glance:
+# two files with the same -prNNNNN suffix are one PR.
+suffix_patches() {
+    local patch pr
+
+    for patch in "$PATCH_DIR"/*.patch; do
+        [ -e "$patch" ] || continue
+
+        pr="$(sed -n -e 's|^Ollama-PR: .*/pull/\([0-9]*\)$|\1|p' \
+            -e '/^---$/q' "$patch")"
+
+        if [ -z "$pr" ]; then
+            log "No Ollama-PR trailer: $(basename "$patch")"
+            continue
+        fi
+
+        mv "$patch" "${patch%.patch}-pr$pr.patch"
+    done
+}
+
 # Rewrites patches/ from the commits now on top of the tag, so the
 # next release applies against fresh context. Dropped patches vanish
 # because they produced no commit.
@@ -209,6 +231,7 @@ refresh_patches() {
     rm -f "$PATCH_DIR"/*.patch
     git -C "$SRC" format-patch -q --zero-commit --no-signature \
         -o "$PATCH_DIR" "refs/tags/$TAG..HEAD"
+    suffix_patches
     echo "$TAG" >"$PIN_FILE"
 }
 
