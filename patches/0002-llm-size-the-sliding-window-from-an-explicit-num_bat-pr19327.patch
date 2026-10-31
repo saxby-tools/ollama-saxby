@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Niko Lowry <niko@neeks.me>
 Date: Fri, 30 Oct 2026 15:33:34 -0400
-Subject: [PATCH 2/2] llm: size the sliding window from an explicit num_batch
+Subject: [PATCH 2/5] llm: size the sliding window from an explicit num_batch
 
 The window term assumed -ub tops out at 2048, which holds only for the
 automatic batch. An explicit num_batch from the request or Modelfile
@@ -15,6 +15,7 @@ with max(2048, num_batch). Automatic requests are unchanged, since the
 automatic batch never exceeds 2048.
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Ollama-PR: https://github.com/ollama/ollama/pull/19327
 ---
  llm/llama_server.go      | 20 ++++++++++++--------
  llm/llama_server_test.go | 31 ++++++++++++++++++++++++++-----
@@ -22,10 +23,10 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
  3 files changed, 42 insertions(+), 17 deletions(-)
 
 diff --git a/llm/llama_server.go b/llm/llama_server.go
-index a5a52c70..9076e502 100644
+index 95df56a..87a502a 100644
 --- a/llm/llama_server.go
 +++ b/llm/llama_server.go
-@@ -2838,18 +2838,21 @@ func (s *llamaServerRunner) MemorySize() (total, vram uint64) {
+@@ -2848,18 +2848,21 @@ func (s *llamaServerRunner) MemorySize() (total, vram uint64) {
  	return total, vram
  }
  
@@ -53,7 +54,7 @@ index a5a52c70..9076e502 100644
  
  	return weights + kvCache
  }
-@@ -2859,7 +2862,7 @@ func PredictServerVRAM(modelPath string, f *gguf.Model, numCtx, numParallel int)
+@@ -2869,7 +2872,7 @@ func PredictServerVRAM(modelPath string, f *gguf.Model, numCtx, numParallel int)
  // no KV heads (recurrent layers in hybrid models) store nothing, layers marked
  // in sliding_window_pattern store only the window, and non-causal models
  // (embedding encoders) keep no cache at all.
@@ -62,7 +63,7 @@ index a5a52c70..9076e502 100644
  	if !kv.Bool("attention.causal", true) {
  		return 0
  	}
-@@ -2885,7 +2888,8 @@ func predictKVCache(kv *gguf.Metadata, numCtx, numParallel int, cacheType string
+@@ -2895,7 +2898,8 @@ func predictKVCache(kv *gguf.Metadata, numCtx, numParallel int, cacheType string
  	}
  
  	cells := uint64(max(numCtx, 0))
@@ -73,10 +74,10 @@ index a5a52c70..9076e502 100644
  
  	widthK := make([]uint64, layers)
 diff --git a/llm/llama_server_test.go b/llm/llama_server_test.go
-index 4ab8bb19..b5c5c554 100644
+index 31ce508..76eb789 100644
 --- a/llm/llama_server_test.go
 +++ b/llm/llama_server_test.go
-@@ -4079,6 +4079,7 @@ func TestPredictKVCache(t *testing.T) {
+@@ -4102,6 +4102,7 @@ func TestPredictKVCache(t *testing.T) {
  		kv          gguftest.KV
  		numCtx      int
  		numParallel int
@@ -84,7 +85,7 @@ index 4ab8bb19..b5c5c554 100644
  		cacheType   string
  		want        uint64
  	}{
-@@ -4141,6 +4142,19 @@ func TestPredictKVCache(t *testing.T) {
+@@ -4164,6 +4165,19 @@ func TestPredictKVCache(t *testing.T) {
  			numCtx: 1024, numParallel: 1, cacheType: "q8_0",
  			want: (4*8+4*8)*1024*34/32 + (2*16+2*16)*1024*34/32,
  		},
@@ -104,7 +105,7 @@ index 4ab8bb19..b5c5c554 100644
  		{
  			name: "scalar pattern sizes every layer as full",
  			kv: with(sliding, gguftest.KV{
-@@ -4166,7 +4180,7 @@ func TestPredictKVCache(t *testing.T) {
+@@ -4189,7 +4203,7 @@ func TestPredictKVCache(t *testing.T) {
  	for _, tc := range cases {
  		t.Run(tc.name, func(t *testing.T) {
  			kv := loadTestGGUF(t, tc.kv).KV()
@@ -113,7 +114,7 @@ index 4ab8bb19..b5c5c554 100644
  			if got != tc.want {
  				t.Errorf("predictKVCache() = %d, want %d", got, tc.want)
  			}
-@@ -4176,9 +4190,10 @@ func TestPredictKVCache(t *testing.T) {
+@@ -4199,9 +4213,10 @@ func TestPredictKVCache(t *testing.T) {
  
  // TestPredictKVCacheGemma4 checks the estimate against what llama-server
  // allocated for gemma4:31b at 262144 context with a q8_0 cache and -ub 2048,
@@ -127,7 +128,7 @@ index 4ab8bb19..b5c5c554 100644
  func TestPredictKVCacheGemma4(t *testing.T) {
  	headCountKV := make([]uint32, 60)
  	pattern := make([]bool, 60)
-@@ -4205,11 +4220,17 @@ func TestPredictKVCacheGemma4(t *testing.T) {
+@@ -4228,11 +4243,17 @@ func TestPredictKVCacheGemma4(t *testing.T) {
  	}).KV()
  
  	const measured = (10880 + 1275) << 20
@@ -147,7 +148,7 @@ index 4ab8bb19..b5c5c554 100644
 +	}
  }
 diff --git a/server/sched.go b/server/sched.go
-index 82378746..fe79fd1d 100644
+index 32a231b..25313a9 100644
 --- a/server/sched.go
 +++ b/server/sched.go
 @@ -576,7 +576,7 @@ func (s *Scheduler) load(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.De
