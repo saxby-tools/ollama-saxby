@@ -16,10 +16,14 @@ release on its own and opens an issue only when a patch stops applying.
 | 0002 | [ollama#19327](https://github.com/ollama/ollama/pull/19327) | The sliding-window term ignored an explicit num_batch, which reaches llama-server as -ub; a review fix carried with 0001 |
 | 0003 | [ollama#19324](https://github.com/ollama/ollama/pull/19324) | Only the last chunk of each buffer was counted: 5.8 GiB tracked for a model using about 33 GiB |
 | 0004 | [ollama#19325](https://github.com/ollama/ollama/pull/19325) | On Metal, free memory was re-checked before macOS returned it, so one eviction became two |
-| 0005 | [ollama#19417](https://github.com/ollama/ollama/issues/19417) | MLX models skipped the memory pre-flight and were booked at their weights: qwen3.8:27b booked at 16.9 GiB reached 78.8 GiB and the kernel panicked |
+| 0005 | [ollama#19419](https://github.com/ollama/ollama/pull/19419) | MLX models skipped the memory pre-flight and were booked at their weights: qwen3.8:27b booked at 16.9 GiB reached 78.8 GiB and the kernel panicked |
 
 A patch disappears from this table, and from `patches/`, once upstream
 releases it.
+
+Each file name ends in the number of the PR it rides on. One patch per
+PR is the rule; when a review fix has to travel as its own commit, as
+0002 does on 19327, the shared suffix shows the two files are one PR.
 
 ##  Build
 
