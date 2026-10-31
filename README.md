@@ -1,9 +1,17 @@
 #  ollama-saxby
 
-Ollama, built from an upstream release with a few memory fixes that are
-still waiting upstream. Saxby's maintainer runs it; anyone may.
+A way to find Ollama bugs on real hardware, fix them upstream, and run
+the fix until the release that carries it. Saxby's maintainer runs
+Ollama this way; anyone may.
 
-It is a build script in the spirit of an Arch PKGBUILD, not a fork:
+Every patch here is a commit on an open pull request against
+[ollama/ollama](https://github.com/ollama/ollama). The patch exists so
+the fix can run, and be watched, on the machine that found the bug
+while the PR is in review. It is dropped the moment upstream releases
+it. This is not a fork, and nothing lives here that upstream has not
+been offered.
+
+The mechanics are a build script in the spirit of an Arch PKGBUILD:
 upstream's release tag, plus the patches in [`patches/`](patches),
 applied and built on your machine. CI moves it to each new Ollama
 release on its own and opens an issue only when a patch stops applying.
@@ -18,12 +26,16 @@ release on its own and opens an issue only when a patch stops applying.
 | 0004 | [ollama#19325](https://github.com/ollama/ollama/pull/19325) | On Metal, free memory was re-checked before macOS returned it, so one eviction became two |
 | 0005 | [ollama#19419](https://github.com/ollama/ollama/pull/19419) | MLX models skipped the memory pre-flight and were booked at their weights: qwen3.8:27b booked at 16.9 GiB reached 78.8 GiB and the kernel panicked |
 
-A patch disappears from this table, and from `patches/`, once upstream
-releases it.
+Each one started as a problem seen on a running machine, was traced to
+its cause in Ollama, and went upstream as a PR with the measurements
+that found it. A patch disappears from this table, and from
+`patches/`, once upstream releases it.
 
 Each file name ends in the number of the PR it rides on. One patch per
 PR is the rule; when a review fix has to travel as its own commit, as
 0002 does on 19327, the shared suffix shows the two files are one PR.
+[`MAINTAINING.md`](MAINTAINING.md) is the routine that keeps the set
+equal to the open PRs.
 
 ##  Build
 
@@ -101,4 +113,5 @@ moves the pin.
 
 ##  License
 
-MIT, matching Ollama, since every patch here is meant to go upstream.
+MIT, matching Ollama, since every patch here is already on its way
+upstream.
