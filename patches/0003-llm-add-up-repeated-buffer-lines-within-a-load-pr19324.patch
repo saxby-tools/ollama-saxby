@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Niko Lowry <niko@neeks.me>
 Date: Mon, 26 Oct 2026 22:13:08 -0400
-Subject: [PATCH] llm: add up repeated buffer lines within a load
+Subject: [PATCH 3/5] llm: add up repeated buffer lines within a load
 
 memoryParsingWriter stored each buffer line under its component,
 backend and kind, so a repeated key overwrote the one before. That
@@ -20,16 +20,17 @@ after other buffer lines still starts over, so fit probes are still
 replaced by the final load.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Ollama-PR: https://github.com/ollama/ollama/pull/19324
 ---
  llm/llama_server.go      | 18 ++++++++++++++++--
  llm/llama_server_test.go | 34 ++++++++++++++++++++++++++++++++++
  2 files changed, 50 insertions(+), 2 deletions(-)
 
 diff --git a/llm/llama_server.go b/llm/llama_server.go
-index 5805edd6..3b327097 100644
+index 87a502a..b2921ad 100644
 --- a/llm/llama_server.go
 +++ b/llm/llama_server.go
-@@ -2871,10 +2871,18 @@ func PredictServerVRAM(modelPath string, f *gguf.Model, numCtx int) uint64 {
+@@ -3004,10 +3004,18 @@ func kvCacheBytesPer32(cacheType string) uint64 {
  //	CUDA_Host compute buffer size =   268.05 MiB
  //	MTL0_Mapped model buffer size =  1918.35 MiB
  //	ROCm0 model buffer size =  1918.35 MiB
@@ -48,7 +49,7 @@ index 5805edd6..3b327097 100644
  }
  
  type memoryBufferKey struct {
-@@ -2965,11 +2973,17 @@ func (w *memoryParsingWriter) Write(b []byte) (int, error) {
+@@ -3098,11 +3106,17 @@ func (w *memoryParsingWriter) Write(b []byte) (int, error) {
  					if w.buffers == nil {
  						w.buffers = make(map[memoryBufferKey]memoryBuffer)
  					}
@@ -69,10 +70,10 @@ index 5805edd6..3b327097 100644
  				}
  			}
 diff --git a/llm/llama_server_test.go b/llm/llama_server_test.go
-index 68c79856..f2529730 100644
+index 76eb789..3a2d1da 100644
 --- a/llm/llama_server_test.go
 +++ b/llm/llama_server_test.go
-@@ -3132,6 +3132,40 @@ func TestMemoryParsingWriter(t *testing.T) {
+@@ -3156,6 +3156,40 @@ func TestMemoryParsingWriter(t *testing.T) {
  			wantGPU:   1100 + 2200 + 330 + 10 + 20,
  			wantTotal: 1100 + 2200 + 330 + 440 + 10 + 20,
  		},
