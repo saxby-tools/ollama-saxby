@@ -63,8 +63,12 @@ Ollama runs CI on a fork's PR only after a maintainer approves it, so
 
 ##  Rules that are easy to break
 
-- **A patch is its PR's commit.** Never edit a file in `patches/` by
-  hand. Change the PR branch, then regenerate the patch from it.
+- **A patch is its PR's whole diff, as one commit.** Never edit a file
+  in `patches/` by hand. Change the PR branch, then cut the patch from
+  it again; `MAINTAINING.md` has the commands. A PR branch collects
+  merges and fix commits over time, and the patch squashes them.
+  19327 still travels as two files from before this rule; fold them
+  into one the next time that PR changes.
 - **Patches are written against `ollama.version`.** `build.sh` applies
   them on that release first, then rebases them onto the tag being
   built. A patch that does not apply on the pin, in its place in the
@@ -186,16 +190,21 @@ One commit per file, except files that only work together: the pin and
 follow the log: `build:`, `patches:`, `ci:`, `docs:`. The body says
 why.
 
-Pushing is the maintainer's unless they have said otherwise. Hand over
-the exact command with the right remote. A PR branch that was rebased
-needs a force-push; give it with a lease on the old commit, so it
-cannot overwrite work pushed in the meantime:
+The maintainer has delegated pushing for this repo and for the PR
+branches on both forks. Push once the work is verified; do not wait to
+be asked. The limits:
 
-```bash
-git push --force-with-lease=<branch>:<old sha> <remote> <branch>
-```
-
-Rewrite a PR branch only while nobody has reviewed it. Once a review
-exists, add a commit instead, so the reviewer can see the change;
-Ollama squash-merges, and the extra commit travels here as a second
-patch with the same `-prNNNNN` suffix.
+- **Never rewrite a pushed PR branch.** No rebase, no amend, no
+  force-push. An agent session cannot force-push from this machine,
+  and a rewrite hides the change from a reviewer. Bring a branch up to
+  date by merging `origin/main` into it, and add each fix as a new
+  commit, so every push is a fast-forward. Ollama squash-merges, so
+  the extra commits cost nothing upstream.
+- Never push to `origin`. Never push to `main` of either fork, except
+  to sync it with upstream.
+- Updating an open PR's branch or description, and answering a review
+  with what was measured, is routine. Opening a PR, closing one, or
+  filing an issue on ollama/ollama speaks for the maintainer in a new
+  place: draft it and ask first.
+- Rebuilding or restarting the production Ollama is never part of a
+  push. Report that the pin moved and leave the rest to the maintainer.
