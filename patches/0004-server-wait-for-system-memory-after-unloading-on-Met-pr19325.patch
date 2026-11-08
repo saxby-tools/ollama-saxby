@@ -27,10 +27,10 @@ Ollama-PR: https://github.com/ollama/ollama/pull/19325
  2 files changed, 101 insertions(+), 22 deletions(-)
 
 diff --git a/server/sched.go b/server/sched.go
-index 25313a9..2474c72 100644
+index 5f35123..7f7a69c 100644
 --- a/server/sched.go
 +++ b/server/sched.go
-@@ -1482,26 +1482,40 @@ func (runner *runnerRef) needsReload(ctx context.Context, req *LlmRequest) bool
+@@ -1475,26 +1475,40 @@ func (runner *runnerRef) needsReload(ctx context.Context, req *LlmRequest) bool
  // a before and after GPU memory allocation.  The returned channel
  // will be notified when we're done waiting, or have timed out and should
  // proceed anyway
@@ -81,7 +81,7 @@ index 25313a9..2474c72 100644
  	freeMemoryNow := freeMemoryBefore
  
  	go func() {
-@@ -1513,21 +1527,15 @@ func (s *Scheduler) waitForVRAMRecovery(runner *runnerRef, runners []ml.Filtered
+@@ -1506,21 +1520,15 @@ func (s *Scheduler) waitForVRAMRecovery(runner *runnerRef, runners []ml.Filtered
  		for {
  			select {
  			case <-ticker.C:

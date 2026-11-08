@@ -7,7 +7,7 @@ memoryParsingWriter stored each buffer line under its component,
 backend and kind, so a repeated key overwrote the one before. That
 replaces a fit probe's buffers with the final load's, as intended, but
 llama.cpp also repeats a key within one load: mmapped weights arrive as
-many consecutive model lines, and an iSWA model reports its full and
+many model lines, and an iSWA model reports its full and
 sliding-window caches as two KV lines. Only the last of each counted.
 
 gemma4:31b on Metal prints 62 MTL0_Mapped model lines (17790 MiB) and
@@ -15,41 +15,50 @@ two KV lines (10880 + 1275 MiB). Ollama tracked about 5.8 GiB for a
 runner using about 33 GiB, which `ollama ps` showed as 5.2 GB and the
 scheduler used as the runner's VRAM, overstating free memory.
 
-Consecutive lines with the same key now add up. A key that returns
-after other buffer lines still starts over, so fit probes are still
-replaced by the final load.
+Lines now add up within a load pass. A model line after any other kind
+starts a new pass, and a key's first line in a new pass replaces its
+old value, so fit probes are still replaced by the final load. The
+pass, rather than adjacency, decides because llama.cpp b12111 prints a
+rotation buffer after each KV cache when the cache type is quantized,
+which separates an iSWA model's two KV lines.
 
-Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
 Ollama-PR: https://github.com/ollama/ollama/pull/19324
 ---
- llm/llama_server.go      | 18 ++++++++++++++++--
- llm/llama_server_test.go | 34 ++++++++++++++++++++++++++++++++++
- 2 files changed, 50 insertions(+), 2 deletions(-)
+ llm/llama_server.go      | 25 ++++++++++++--
+ llm/llama_server_test.go | 71 ++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 94 insertions(+), 2 deletions(-)
 
 diff --git a/llm/llama_server.go b/llm/llama_server.go
-index 87a502a..b2921ad 100644
+index ffee7ef..3198aad 100644
 --- a/llm/llama_server.go
 +++ b/llm/llama_server.go
-@@ -3004,10 +3004,18 @@ func kvCacheBytesPer32(cacheType string) uint64 {
- //	CUDA_Host compute buffer size =   268.05 MiB
- //	MTL0_Mapped model buffer size =  1918.35 MiB
- //	ROCm0 model buffer size =  1918.35 MiB
-+//
-+// llama.cpp prints one line per buffer, so one key can repeat within a load:
-+// large mmapped weights arrive as many consecutive model lines, and an iSWA
-+// model reports its full and sliding-window caches as two KV lines.
-+// Consecutive lines with the same key add up. A key that returns after other
-+// buffer lines starts over, so a fit probe's buffers are replaced by the
-+// final load's.
- type memoryParsingWriter struct {
+@@ -3010,6 +3010,16 @@ type memoryParsingWriter struct {
  	inner   io.Writer
  	runner  *llamaServerRunner
  	buffers map[memoryBufferKey]memoryBuffer
-+	lastKey *memoryBufferKey
++
++	// llama.cpp prints one line per buffer, so a key can repeat within one
++	// load: mmapped weights arrive as many model lines, and an iSWA model
++	// reports its full and sliding-window caches as two KV lines, with a
++	// rotation line after each when the cache is quantized. Lines add up
++	// within a pass. A model line after any other kind starts a new pass,
++	// and a key's first line in a new pass replaces its old value, so a
++	// fit probe's buffers give way to the final load's.
++	pass     int
++	lastKind string
  }
  
  type memoryBufferKey struct {
-@@ -3098,11 +3106,17 @@ func (w *memoryParsingWriter) Write(b []byte) (int, error) {
+@@ -3020,6 +3030,7 @@ type memoryBufferKey struct {
+ 
+ type memoryBuffer struct {
+ 	bytes uint64
++	pass  int
+ }
+ 
+ // deviceFreeRegex matches per-device free VRAM reported at model load time:
+@@ -3100,11 +3111,21 @@ func (w *memoryParsingWriter) Write(b []byte) (int, error) {
  					if w.buffers == nil {
  						w.buffers = make(map[memoryBufferKey]memoryBuffer)
  					}
@@ -60,20 +69,24 @@ index 87a502a..b2921ad 100644
  						kind:      string(match[3]),
 -					}] = memoryBuffer{bytes: uint64(mib * 1024 * 1024)}
 +					}
-+					bytes := uint64(mib * 1024 * 1024)
-+					if w.lastKey != nil && *w.lastKey == key {
-+						bytes += w.buffers[key].bytes
++					if key.kind == "model" && w.lastKind != "" && w.lastKind != "model" {
++						w.pass++
 +					}
-+					w.buffers[key] = memoryBuffer{bytes: bytes}
-+					w.lastKey = &key
++					w.lastKind = key.kind
++
++					bytes := uint64(mib * 1024 * 1024)
++					if prev, ok := w.buffers[key]; ok && prev.pass == w.pass {
++						bytes += prev.bytes
++					}
++					w.buffers[key] = memoryBuffer{bytes: bytes, pass: w.pass}
  					w.updateRunnerMemoryLocked()
  				}
  			}
 diff --git a/llm/llama_server_test.go b/llm/llama_server_test.go
-index 76eb789..3a2d1da 100644
+index c3d8a30..7e5061d 100644
 --- a/llm/llama_server_test.go
 +++ b/llm/llama_server_test.go
-@@ -3156,6 +3156,40 @@ func TestMemoryParsingWriter(t *testing.T) {
+@@ -3166,6 +3166,77 @@ func TestMemoryParsingWriter(t *testing.T) {
  			wantGPU:   1100 + 2200 + 330 + 10 + 20,
  			wantTotal: 1100 + 2200 + 330 + 440 + 10 + 20,
  		},
@@ -110,6 +123,43 @@ index 76eb789..3a2d1da 100644
 +			},
 +			wantGPU:   200 + 200 + 600 + 60,
 +			wantTotal: 200 + 200 + 600 + 60,
++		},
++		{
++			// llama.cpp b12111 with a quantized cache: each KV cache is
++			// followed by its rotation buffer, so the two KV lines of an
++			// iSWA model are no longer adjacent.
++			name: "rotation lines between iswa caches",
++			lines: []string{
++				"load_tensors:  MTL0_Mapped model buffer size =   290.80 MiB\n",
++				"load_tensors:  MTL0_Mapped model buffer size =  1102.52 MiB\n",
++				"llama_kv_cache:       MTL0 KV buffer size = 10880.00 MiB\n",
++				"init_rotation:       MTL0 rotation buffer size =     0.63 MiB\n",
++				"llama_kv_cache:       MTL0 KV buffer size =  1275.00 MiB\n",
++				"init_rotation:       MTL0 rotation buffer size =     3.13 MiB\n",
++				"sched_reserve:       MTL0 compute buffer size =  3575.00 MiB\n",
++			},
++			wantGPU:   290.80 + 1102.52 + 10880 + 0.63 + 1275 + 3.13 + 3575,
++			wantTotal: 290.80 + 1102.52 + 10880 + 0.63 + 1275 + 3.13 + 3575,
++		},
++		{
++			name: "fit probe with rotation lines is replaced by final load",
++			lines: []string{
++				"load_tensors:  MTL0_Mapped model buffer size =   100.00 MiB\n",
++				"llama_kv_cache:       MTL0 KV buffer size =   500.00 MiB\n",
++				"init_rotation:       MTL0 rotation buffer size =     1.00 MiB\n",
++				"llama_kv_cache:       MTL0 KV buffer size =    50.00 MiB\n",
++				"init_rotation:       MTL0 rotation buffer size =     1.00 MiB\n",
++				"sched_reserve:       MTL0 compute buffer size =    40.00 MiB\n",
++				"load_tensors:  MTL0_Mapped model buffer size =   200.00 MiB\n",
++				"load_tensors:  MTL0_Mapped model buffer size =   200.00 MiB\n",
++				"llama_kv_cache:       MTL0 KV buffer size =   600.00 MiB\n",
++				"init_rotation:       MTL0 rotation buffer size =     2.00 MiB\n",
++				"llama_kv_cache:       MTL0 KV buffer size =    60.00 MiB\n",
++				"init_rotation:       MTL0 rotation buffer size =     2.00 MiB\n",
++				"sched_reserve:       MTL0 compute buffer size =    45.00 MiB\n",
++			},
++			wantGPU:   200 + 200 + 600 + 2 + 60 + 2 + 45,
++			wantTotal: 200 + 200 + 600 + 2 + 60 + 2 + 45,
 +		},
  		{
  			name: "rc21 fit probe accounting",

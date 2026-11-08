@@ -748,7 +748,7 @@ index 0000000..d73e4cc
 +	}
 +}
 diff --git a/server/sched.go b/server/sched.go
-index 2474c72..94b0ff7 100644
+index 7f7a69c..e42f6cd 100644
 --- a/server/sched.go
 +++ b/server/sched.go
 @@ -78,11 +78,28 @@ type Scheduler struct {
@@ -788,7 +788,7 @@ index 2474c72..94b0ff7 100644
  		getGpuFn:        discover.GPUDevices,
  		getSystemInfoFn: discover.GetSystemInfo,
  		waitForRecovery: 5 * time.Second,
-@@ -629,8 +647,19 @@ func (s *Scheduler) load(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.De
+@@ -622,8 +640,19 @@ func (s *Scheduler) load(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.De
  				}
  			}
  		} else {
@@ -810,7 +810,7 @@ index 2474c72..94b0ff7 100644
  		}
  		if err != nil {
  			slog.Info("failed to create server", "model", req.model.ShortName, "error", err)
-@@ -844,6 +873,42 @@ func explicitPartialGPUOffload(opts api.Options, f *gguf.Model) bool {
+@@ -837,6 +866,42 @@ func explicitPartialGPUOffload(opts api.Options, f *gguf.Model) bool {
  	return uint64(opts.NumGPU) < f.KV().BlockCount()+1
  }
  

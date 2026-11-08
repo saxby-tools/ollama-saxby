@@ -39,7 +39,7 @@ Ollama-PR: https://github.com/ollama/ollama/pull/19327
  4 files changed, 316 insertions(+), 17 deletions(-)
 
 diff --git a/llm/llama_server.go b/llm/llama_server.go
-index db6d743..95df56a 100644
+index 4d3928b..c8e9983 100644
 --- a/llm/llama_server.go
 +++ b/llm/llama_server.go
 @@ -2848,25 +2848,144 @@ func (s *llamaServerRunner) MemorySize() (total, vram uint64) {
@@ -201,7 +201,7 @@ index db6d743..95df56a 100644
  
  // memoryParsingWriter wraps an io.Writer and parses llama-server log output
 diff --git a/llm/llama_server_test.go b/llm/llama_server_test.go
-index 7bb0880..31ce508 100644
+index 063c9c5..e58f1a1 100644
 --- a/llm/llama_server_test.go
 +++ b/llm/llama_server_test.go
 @@ -8,6 +8,7 @@ import (
@@ -212,7 +212,7 @@ index 7bb0880..31ce508 100644
  	"net"
  	"net/http"
  	"net/http/httptest"
-@@ -4058,3 +4059,180 @@ func TestLlamaServerCompletionThinkingFormat(t *testing.T) {
+@@ -4068,3 +4069,180 @@ func TestLlamaServerCompletionThinkingFormat(t *testing.T) {
  		t.Errorf("json format converted a schema, %d conversions", got)
  	}
  }
@@ -394,10 +394,10 @@ index 7bb0880..31ce508 100644
 +	}
 +}
 diff --git a/server/sched.go b/server/sched.go
-index e1323b9..32a231b 100644
+index 14a78db..57a9b18 100644
 --- a/server/sched.go
 +++ b/server/sched.go
-@@ -576,7 +576,7 @@ func (s *Scheduler) load(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.De
+@@ -569,7 +569,7 @@ func (s *Scheduler) load(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.De
  			}
  
  			predictedCtx := effectiveLlamaServerContext(req.opts.NumCtx, f, numParallel)
@@ -406,7 +406,7 @@ index e1323b9..32a231b 100644
  			loadGpus, launchOpts = selectLlamaServerPlacement(systemInfo, gpus, predicted, req.opts)
  			availableForBatch, _, _ := availableMemoryForPlacement(systemInfo, loadGpus, launchOpts)
  			flashAttention := llm.LlamaServerFlashAttention(loadGpus)
-@@ -829,7 +829,7 @@ func (req *LlmRequest) reduceAutoNumCtxForLoadOOM(f *gguf.Model, numParallel int
+@@ -822,7 +822,7 @@ func (req *LlmRequest) reduceAutoNumCtxForLoadOOM(f *gguf.Model, numParallel int
  
  	req.opts.NumCtx = newNumCtx
  	predictedCtx := effectiveLlamaServerContext(req.opts.NumCtx, f, numParallel)
@@ -415,7 +415,7 @@ index e1323b9..32a231b 100644
  	available, _, _ := availableMemoryForPlacement(systemInfo, gpus, launchOpts)
  	req.applyAutomaticGenerationBatch(completion, predictedCtx, predictedVRAM, available, llm.LlamaServerFlashAttention(gpus), gpus)
  	newNumBatch = req.opts.NumBatch
-@@ -1173,7 +1173,7 @@ func logSelectedGPUGroup(all, selected []ml.DeviceInfo) {
+@@ -1166,7 +1166,7 @@ func logSelectedGPUGroup(all, selected []ml.DeviceInfo) {
  
  func (s *Scheduler) applyLlamaServerMmapDefaults(req *LlmRequest, launchOpts api.Options, systemInfo ml.SystemInfo, gpus []ml.DeviceInfo, f *gguf.Model, numParallel int) api.Options {
  	predictedCtx := effectiveLlamaServerContext(req.opts.NumCtx, f, numParallel)
@@ -424,7 +424,7 @@ index e1323b9..32a231b 100644
  	availableVRAM, _, _ := availableMemoryForPlacement(systemInfo, gpus, launchOpts)
  
  	if reason := disableMmapDefaultReason(runtime.GOOS, req.opts, gpus, f.KV().BlockCount(), predictedVRAM, availableVRAM); reason != "" {
-@@ -1237,7 +1237,7 @@ func (s *Scheduler) maybeDisableMmapForHostPressure(req *LlmRequest, launchOpts
+@@ -1230,7 +1230,7 @@ func (s *Scheduler) maybeDisableMmapForHostPressure(req *LlmRequest, launchOpts
  	modelSize := modelFileSize(req.model.modelPaths()...)
  	loadedMmapSize := s.loadedMmapModelSizeLocked()
  	predictedCtx := effectiveLlamaServerContext(req.opts.NumCtx, f, numParallel)
