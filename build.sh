@@ -47,15 +47,19 @@ EXIT_TOOLCHAIN=4
 TAG_ARG="pinned"
 PREFIX="$DEFAULT_PREFIX"
 REFRESH=0
+RESUME=0
 STAGE="all"
 SKIP_CHECK=0
 NO_MLX=0
 BACKENDS=""
 JOBS="$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)"
 
-# Set by the steps below.
+# Set by the steps below. The three lists hold commit subjects, one
+# per line.
 TAG=""
+PIN=""
 SRC=""
+GIT_OUT=""
 APPLIED=""
 DROPPED=""
 CONFLICTED=""
@@ -75,6 +79,9 @@ Usage: ./build.sh [options]
                     native build, no install. What CI runs.
   --refresh         After patches apply, rewrite patches/ against the
                     new tag and record it in ollama.version.
+  --resume          Skip fetching and applying: take the commits now
+                    on top of the tag in src/ as the patch set. For
+                    after a conflict was resolved there by hand.
   --no-check        Skip the Go tests.
   --no-mlx          Build without the MLX engine (macOS).
   --backends LIST   GPU backends for Linux, e.g. "cuda_v13;vulkan".
@@ -100,6 +107,7 @@ parse_args() {
             --fetch-only) STAGE="fetch" ;;
             --prepare-only) STAGE="prepare" ;;
             --refresh) REFRESH=1 ;;
+            --resume) RESUME=1 ;;
             --no-check) SKIP_CHECK=1 ;;
             --no-mlx) NO_MLX=1 ;;
             --backends) BACKENDS="${2:?--backends needs a value}"; shift ;;
@@ -124,8 +132,10 @@ latest_final_tag() {
 }
 
 resolve_tag() {
+    PIN="$(tr -d '[:space:]' <"$PIN_FILE")"
+
     if [ "$TAG_ARG" = "pinned" ]; then
-        TAG="$(tr -d '[:space:]' <"$PIN_FILE")"
+        TAG="$PIN"
         return
     fi
 
@@ -145,6 +155,11 @@ resolve_tag() {
 fetch_source() {
     SRC="$SRC_ROOT/ollama-$TAG"
 
+    if [ "$RESUME" -eq 1 ]; then
+        log "Resuming in $SRC"
+        return
+    fi
+
     if [ ! -d "$SRC/.git" ]; then
         log "Fetching Ollama $TAG"
         mkdir -p "$SRC_ROOT"
@@ -155,6 +170,7 @@ fetch_source() {
 
     log "Reusing $SRC"
     git -C "$SRC" am --abort >/dev/null 2>&1 || true
+    git -C "$SRC" rebase --abort >/dev/null 2>&1 || true
     git -C "$SRC" reset -q --hard "refs/tags/$TAG"
     git -C "$SRC" clean -q -fd
 }
@@ -162,31 +178,18 @@ fetch_source() {
 # ---------------------------------------------------------
 # PREPARE
 # ---------------------------------------------------------
-# Each patch either applies (three-way), is already upstream (it
-# applies in reverse, so it is dropped), or conflicts. Conflicts are
-# reported together; nothing is built from a partial patch set.
-apply_patch() {
-    local patch="$1"
-    local name
-    name="$(basename "$patch")"
-
-    if git -C "$SRC" apply --check --reverse "$patch" >/dev/null 2>&1; then
-        log "Already upstream, dropping: $name"
-        DROPPED="$DROPPED $name"
-        return
-    fi
-
-    if git -C "$SRC" -c user.name="$SCRATCH_NAME" \
+# The patches are written against the pinned release, so they are
+# applied there first, where they must apply exactly. To build any
+# other tag the resulting commits are rebased onto it. That is a real
+# three-way merge: git has both releases and every commit's parent, so
+# it can carry a patch across upstream changes around it, and a patch
+# upstream already contains comes out empty and is dropped. Applying
+# the files straight onto the new tag cannot merge at all, since the
+# versions the patches were cut from are not in that checkout.
+scratch_git() {
+    git -C "$SRC" -c user.name="$SCRATCH_NAME" \
         -c user.email="$SCRATCH_EMAIL" -c commit.gpgsign=false \
-        am -q -3 "$patch" >/dev/null 2>&1; then
-        log "Applied: $name"
-        APPLIED="$APPLIED $name"
-        return
-    fi
-
-    git -C "$SRC" am --abort >/dev/null 2>&1 || true
-    log "Conflict: $name"
-    CONFLICTED="$CONFLICTED $name"
+        -c advice.detachedHead=false "$@"
 }
 
 write_summary() {
@@ -195,10 +198,119 @@ write_summary() {
     {
         echo "### $PKGNAME on Ollama $TAG"
         echo
-        echo "- Applied:${APPLIED:- none}"
-        echo "- Dropped (already upstream):${DROPPED:- none}"
-        echo "- Conflicted:${CONFLICTED:- none}"
+        echo "Applied:"
+        echo "${APPLIED:-none}"
+        echo
+        echo "Dropped (already upstream):"
+        echo "${DROPPED:-none}"
+        echo
+        echo "Conflicted:"
+        echo "${CONFLICTED:-none}"
     } >>"$summary"
+}
+
+# Shows what git said, then stops. Nothing is built from a partial set.
+fail_conflict() {
+    cat "$GIT_OUT" >&2
+    write_summary
+    fail "$1" "$EXIT_CONFLICT"
+}
+
+apply_on_pin() {
+    local patch name
+
+    if [ "$PIN" != "$TAG" ]; then
+        log "Fetching $PIN, the release the patches were written for"
+        git -C "$SRC" fetch -q --depth 1 origin \
+            "refs/tags/$PIN:refs/tags/$PIN"
+        scratch_git checkout -q --detach "refs/tags/$PIN"
+    fi
+
+    for patch in "$PATCH_DIR"/*.patch; do
+        [ -e "$patch" ] || continue
+        name="$(basename "$patch")"
+
+        if ! scratch_git am "$patch" >"$GIT_OUT" 2>&1; then
+            scratch_git am --abort >/dev/null 2>&1 || true
+            CONFLICTED="$name"
+            fail_conflict "$name does not apply to $PIN, the release it \
+was written for. Regenerate it against $PIN."
+        fi
+
+        log "Applied on $PIN: $name"
+    done
+}
+
+# Sorts the commits that were on the pin into those still present on
+# the new tag and those the rebase dropped as already upstream.
+sort_applied_and_dropped() {
+    local before="$1"
+    local after subject
+
+    after="$(scratch_git log --reverse --format=%s "refs/tags/$TAG..HEAD")"
+
+    while IFS= read -r subject; do
+        [ -n "$subject" ] || continue
+
+        if printf '%s\n' "$after" | /usr/bin/grep -qxF -e "$subject"; then
+            APPLIED="$APPLIED${APPLIED:+
+}$subject"
+            continue
+        fi
+
+        log "Already upstream, dropped: $subject"
+        DROPPED="$DROPPED${DROPPED:+
+}$subject"
+    done <<EOF
+$before
+EOF
+}
+
+# On a conflict the rebase is left stopped in src/, so it can be
+# resolved there and picked up with --resume. The next ordinary run
+# aborts it and starts over.
+move_to_tag() {
+    local before
+
+    before="$(scratch_git log --reverse --format=%s "refs/tags/$PIN..HEAD")"
+
+    if [ "$PIN" = "$TAG" ]; then
+        APPLIED="$before"
+        return
+    fi
+
+    log "Rebasing the patches from $PIN onto $TAG"
+
+    if scratch_git rebase --onto "refs/tags/$TAG" "refs/tags/$PIN" \
+        >"$GIT_OUT" 2>&1; then
+        sort_applied_and_dropped "$before"
+        return
+    fi
+
+    CONFLICTED="$(scratch_git log -1 --format=%s REBASE_HEAD)"
+    log "Conflict: $CONFLICTED"
+    fail_conflict "the patches do not rebase onto $TAG. The rebase is \
+stopped in $SRC: resolve it there and run 'git rebase --continue', then \
+rerun with --resume, or fix the PR branch and regenerate the patch."
+}
+
+# --resume: a human finished the rebase by hand. Take what is there.
+adopt_source() {
+    if [ -d "$SRC/.git/rebase-merge" ] || [ -d "$SRC/.git/rebase-apply" ]; then
+        fail "a rebase is still in progress in $SRC; finish it first"
+    fi
+
+    if [ -n "$(git -C "$SRC" status --porcelain --untracked-files=no)" ]; then
+        fail "$SRC has uncommitted changes; commit or discard them first"
+    fi
+
+    if ! git -C "$SRC" merge-base --is-ancestor "refs/tags/$TAG" HEAD; then
+        fail "the commits in $SRC are not on top of $TAG"
+    fi
+
+    APPLIED="$(scratch_git log --reverse --format=%s "refs/tags/$TAG..HEAD")"
+    log "Adopting the commits on top of $TAG:"
+    printf '%s\n' "$APPLIED" >&2
 }
 
 # Each patch names the upstream PR it rides on, as an Ollama-PR
@@ -236,22 +348,16 @@ refresh_patches() {
 }
 
 prepare() {
-    local patch
+    GIT_OUT="$(mktemp)"
 
-    for patch in "$PATCH_DIR"/*.patch; do
-        [ -e "$patch" ] || continue
-        apply_patch "$patch"
-    done
+    if [ "$RESUME" -eq 1 ]; then
+        adopt_source
+    else
+        apply_on_pin
+        move_to_tag
+    fi
 
     write_summary
-
-    if [ -n "$CONFLICTED" ]; then
-        fail "patches do not apply to $TAG:$CONFLICTED" "$EXIT_CONFLICT"
-    fi
-
-    if [ "$REFRESH" -eq 1 ]; then
-        refresh_patches
-    fi
 }
 
 # ---------------------------------------------------------
@@ -395,6 +501,11 @@ main() {
 
     if [ "$SKIP_CHECK" -eq 0 ]; then
         check
+    fi
+
+    # Only a set that passed its tests is written back.
+    if [ "$REFRESH" -eq 1 ]; then
+        refresh_patches
     fi
 
     if [ "$STAGE" = "prepare" ]; then
