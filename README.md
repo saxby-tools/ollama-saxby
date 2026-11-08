@@ -61,6 +61,7 @@ never overwritten, and rolling back is moving the link.
 | `--tag latest` | Newest final release right now, verified or not |
 | `--tag v0.40.13-rc0` | Any tag you name, release candidates included |
 | `--prepare-only` | Apply the patches and run the tests; no build |
+| `--resume` | Use the commits already in `src/`, after a conflict was resolved there by hand |
 | `--no-mlx` | Skip the MLX engine |
 | `--backends "cuda_v13;vulkan"` | GPU backends on Linux |
 | `--prefix DIR` | Install somewhere else |
@@ -99,8 +100,10 @@ To go back to stock Ollama, point the service at your packaged
 [`release-check`](.github/workflows/release-check.yml) runs daily:
 
 1. Finds Ollama's newest final release.
-2. Applies each patch with a three-way merge. A patch that applies in
-   reverse is already upstream, and is dropped.
+2. Applies the patches on the pinned release, where they were written,
+   then rebases them onto the new one. That is a real three-way merge,
+   so a patch survives upstream changes around it, and a patch upstream
+   already contains comes out empty and is dropped.
 3. Runs Ollama's `llm` and `server` tests on the result.
 4. If everything passes, rewrites `patches/` against the new release,
    moves `ollama.version` and pushes. A macOS job then does the full
@@ -110,6 +113,10 @@ To go back to stock Ollama, point the service at your packaged
 
 Run it by hand from the Actions tab to check any tag; a named tag never
 moves the pin.
+
+A merge that passes is not proof a patch still means what it did.
+When the alert issue opens, or upstream bumps llama.cpp, see
+[`MAINTAINING.md`](MAINTAINING.md).
 
 ##  License
 
