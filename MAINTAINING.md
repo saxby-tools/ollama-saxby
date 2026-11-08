@@ -26,12 +26,15 @@ each one. One patch per PR is the rule.
    gh pr list --repo ollama/ollama --author nikolowry --state all
    ```
 
-   Merged: nothing to do; the next release that contains it makes the
-   patch apply in reverse and `release-check` drops it. Closed without
-   merge: read why, and decide whether to carry it or drop it. New
-   review comments: answer them, fix on the PR branch in
-   `~/Workspaces/ollama`, push to `saxby`, then regenerate the patch
-   (next section).
+   Merged: nothing to do; on the next release that contains it, the
+   rebase leaves the patch empty and `release-check` drops it. Closed
+   without merge: read why, and decide whether to carry it or drop it.
+   Conflicting with `main`: merge `origin/main` into the PR branch now;
+   do not wait for a release to break the patch. New review comments:
+   answer them, fix on the PR branch in `~/Workspaces/ollama`, push to
+   the remote that holds that PR's head, then regenerate the patch
+   (next section). The PRs do not all live in one fork:
+   [`AGENTS.md`](AGENTS.md) has the map.
 
 2. **Patch set equals PR set.** `ls patches/` should show one file per
    open PR. Two files with the same suffix mean a review fix travelled
@@ -88,9 +91,27 @@ each one. One patch per PR is the rule.
    gh pr create --repo ollama/ollama --base main --head saxby-tools:<branch>
    ```
 
-3. In `~/Workspaces/ollama-saxby`, write the patch with
-   `git format-patch` and add an `Ollama-PR:` trailer to its commit
-   message, after the `Co-Authored-By` line and before the `---`:
+3. Cut the patch: the PR's whole diff against `origin/main` as one
+   commit, however many commits and merges the branch holds. In
+   `~/Workspaces/ollama`:
+
+   ```bash
+   git checkout --detach origin/main
+   ```
+
+   ```bash
+   git merge --squash <branch>
+   ```
+
+   Commit it with the PR's title and reasoning as the message, then:
+
+   ```bash
+   git format-patch -1 --zero-commit --no-signature \
+       -o ~/Workspaces/ollama-saxby/patches
+   ```
+
+   Add an `Ollama-PR:` trailer to the patch's commit message, after
+   the `Co-Authored-By` line and before the `---`:
 
    ```
    Ollama-PR: https://github.com/ollama/ollama/pull/<number>
@@ -124,14 +145,17 @@ The alert issue's log names the patch and shows git's conflict.
    ./build.sh --prepare-only --tag <tag>
    ```
 
-2. Fix it on the PR first, since the patch is that PR's commit: in
-   `~/Workspaces/ollama`, rebase the PR branch on `origin/main`,
-   resolve, run `go test ./llm ./server`, and push to the remote that
-   holds that PR's head. The PR conflicts with `main` for the same
-   reason, so this is owed upstream anyway.
+2. Fix it on the PR first, since the patch is that PR's diff: in
+   `~/Workspaces/ollama`, merge `origin/main` into the PR branch,
+   resolve, add any further fix as a new commit, run
+   `go test ./llm ./server`, and push to the remote that holds that
+   PR's head ([`AGENTS.md`](AGENTS.md) has the map). Merge, never
+   rebase: a pushed PR branch is not rewritten. The PR conflicts with
+   `main` for the same reason, so this is owed upstream anyway.
 
-3. If the reworked commit still applies on the pinned release, replace
-   its file in `patches/` (keep the `Ollama-PR:` trailer) and run:
+3. Cut the PR's whole diff as one commit ("Adding or regenerating a
+   patch", step 3). If it applies on the pinned release, replace its
+   file in `patches/` and run:
 
    ```bash
    ./build.sh --prepare-only --tag <tag> --refresh
