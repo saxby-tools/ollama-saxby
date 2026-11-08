@@ -48,8 +48,12 @@ each one. One patch per PR is the rule.
 
 4. **Release pin.** `ollama.version` is the newest release CI has
    verified. If `release-check` opened an issue in ollama-saxby, a
-   patch stopped applying on a new release; rebase it on the PR branch
-   and regenerate.
+   patch stopped rebasing onto a new release; see "When a patch
+   conflicts" below. Also read the release's changes to the files the
+   patches touch even when CI passed: a clean merge does not show that
+   a patch still does its job. A llama.cpp bump (`LLAMA_CPP_VERSION`)
+   is the usual cause, since several patches mirror its allocation or
+   parse its log.
 
 5. **Production version.** Compare the running build with the pin:
 
@@ -102,4 +106,44 @@ each one. One patch per PR is the rule.
    against the pinned tag and adds the `-prNNNNN` suffix from the
    trailer.
 
+   The patch must apply on the pinned release, in its place in the
+   set. A PR branch sits on `origin/main`, which may be ahead of the
+   pin; if the patch does not apply there, move the pin first with
+   `--tag <newer release> --refresh`, or use the conflict steps below.
+
 5. Add a row to the README table, commit one file per commit, push.
+
+##  When a patch conflicts
+
+The alert issue's log names the patch and shows git's conflict.
+
+1. Reproduce it. This leaves the rebase stopped in
+   `src/ollama-<tag>`:
+
+   ```bash
+   ./build.sh --prepare-only --tag <tag>
+   ```
+
+2. Fix it on the PR first, since the patch is that PR's commit: in
+   `~/Workspaces/ollama`, rebase the PR branch on `origin/main`,
+   resolve, run `go test ./llm ./server`, and push to the remote that
+   holds that PR's head. The PR conflicts with `main` for the same
+   reason, so this is owed upstream anyway.
+
+3. If the reworked commit still applies on the pinned release, replace
+   its file in `patches/` (keep the `Ollama-PR:` trailer) and run:
+
+   ```bash
+   ./build.sh --prepare-only --tag <tag> --refresh
+   ```
+
+4. If it cannot apply on the old release, resolve inside the stopped
+   rebase in `src/ollama-<tag>` so the result matches the PR commit,
+   run `git rebase --continue`, then:
+
+   ```bash
+   ./build.sh --prepare-only --tag <tag> --resume --refresh
+   ```
+
+Either way the refresh moves `ollama.version` to `<tag>`, and the
+patches and the pin are committed together.
