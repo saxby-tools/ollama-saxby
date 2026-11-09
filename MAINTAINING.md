@@ -82,6 +82,18 @@ each one. One patch per PR is the rule.
    `build.sh` installs into a new folder and moves `current`; the old
    folder stays for rollback.
 
+   `kickstart` reports success even when the launch fails, so confirm
+   the running version afterwards:
+
+   ```bash
+   curl -s http://127.0.0.1:11434/api/version
+   ```
+
+   Give it 15 seconds before calling it failed. On Nov. 8, 2026, macOS
+   refused the first launch of a new build (`OS_REASON_CODESIGNING`,
+   launch constraint violation) and launchd started it again 10
+   seconds later; issue 2 tracks why.
+
 ##  Adding or regenerating a patch
 
 1. In `~/Workspaces/ollama`, branch off `origin/main`, commit the
