@@ -14,10 +14,10 @@ one never reaches the PR.
 
 | PR | Patch | Head repository | Remote in `~/Workspaces/ollama` |
 | --- | --- | --- | --- |
-| [19327](https://github.com/ollama/ollama/pull/19327) | 0001, 0002 | nikolowry/ollama | `fork` |
-| [19324](https://github.com/ollama/ollama/pull/19324) | 0003 | nikolowry/ollama | `fork` |
-| [19325](https://github.com/ollama/ollama/pull/19325) | 0004 | nikolowry/ollama | `fork` |
-| [19419](https://github.com/ollama/ollama/pull/19419) | 0005 | saxby-tools/ollama | `saxby` |
+| [19327](https://github.com/ollama/ollama/pull/19327) | 0001 | nikolowry/ollama | `fork` |
+| [19324](https://github.com/ollama/ollama/pull/19324) | 0002 | nikolowry/ollama | `fork` |
+| [19325](https://github.com/ollama/ollama/pull/19325) | 0003 | nikolowry/ollama | `fork` |
+| [19419](https://github.com/ollama/ollama/pull/19419) | 0004 | saxby-tools/ollama | `saxby` |
 
 The first three were opened from the maintainer's personal fork before
 saxby-tools/ollama existed. A PR's head cannot be moved to another
@@ -67,8 +67,6 @@ Ollama runs CI on a fork's PR only after a maintainer approves it, so
   in `patches/` by hand. Change the PR branch, then cut the patch from
   it again; `MAINTAINING.md` has the commands. A PR branch collects
   merges and fix commits over time, and the patch squashes them.
-  19327 still travels as two files from before this rule; fold them
-  into one the next time that PR changes.
 - **Patches are written against `ollama.version`.** `build.sh` applies
   them on that release first, then rebases them onto the tag being
   built. A patch that does not apply on the pin, in its place in the
