@@ -37,9 +37,10 @@ each one. One patch per PR is the rule.
    [`AGENTS.md`](AGENTS.md) has the map.
 
 2. **Patch set equals PR set.** `ls patches/` should show one file per
-   open PR. Two files with the same suffix mean a review fix travelled
-   as its own commit; that is allowed, and the README table says so.
-   A file with no suffix is missing its `Ollama-PR:` trailer.
+   open PR. Two files with the same suffix mean a review fix was added
+   as its own file; cut the PR's whole diff as one commit instead
+   ("Adding or regenerating a patch", step 3). A file with no suffix
+   is missing its `Ollama-PR:` trailer.
 
 3. **Fork main equals upstream.**
 
