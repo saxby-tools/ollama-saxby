@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Niko Lowry <niko@neeks.me>
-Date: Mon, 26 Oct 2026 14:49:25 -0400
-Subject: [PATCH 1/5] llm: size the predicted KV cache per layer
+Date: Sun, 8 Nov 2026 19:28:55 -0500
+Subject: [PATCH 1/4] llm: size the predicted KV cache per layer
 
 PredictServerVRAM sized every layer's KV cache with the smallest
 head_count_kv, embedding_length/head_count as the head size, the full
@@ -13,42 +13,50 @@ prediction also triggered metal_partial_offload, which turns off mmap.
 
 The estimate now follows llama.cpp's allocation: per-layer
 head_count_kv, key_length and value_length (with the _swa variants),
-sliding-window layers holding window plus one batch per sequence,
-no cache for layers without KV heads or for non-causal models, and
-the configured cache type. Unquantized caches size V at the widest
-layer, as llama.cpp does without flash attention.
+and the configured cache type. Sliding-window layers hold the window
+plus one batch per sequence, sized with max(2048, num_batch), since an
+explicit num_batch reaches llama-server as -ub. Non-causal models keep
+no cache. Unquantized caches size V at the widest layer, as llama.cpp
+does without flash attention.
 
-Predictions on an M5 Max against llama-server's own allocation
-(weights + KV + compute), q8_0 cache:
+Layers llama.cpp gives no cache of their own are skipped: layers with
+no KV heads; recurrent layers of qwen3next, qwen35 and qwen35moe;
+the gemma layers that read an earlier layer's cache; and MTP layers
+unless draft_num_predict is set. A deepseek2 MLA cache stores K only.
+PredictServerVRAM takes the request's options for num_batch and
+draft_num_predict.
+
+Measured against llama-server, q8_0 cache:
 
   gemma4:31b        262144   57.9 -> 30.4 GiB   measured 31.0
   qwen3-coder-next  262144   54.2 -> 51.4 GiB   measured 52.4
-  phi4-mini         131072   18.3 -> 10.8 GiB   measured 12.0
+  qwen3.5:0.8b       32768   KV 816 -> 204 MiB  allocated 204.00
+  gemma4:e2b         32768   KV 275 -> 118 MiB  allocated 111.56
 
-The gemma4 KV estimate matches llama-server to the MiB at -ub 2048
-(12155 MiB). The compute graph is still not counted, as before; the
-scheduler's 20% headroom covers it.
+The compute graph and the recurrent state of hybrid models are still
+not counted; the scheduler's 20% headroom covers them.
 
-Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
 Ollama-PR: https://github.com/ollama/ollama/pull/19327
 ---
- llm/llama_server.go      | 145 ++++++++++++++++++++++++++++---
- llm/llama_server_test.go | 178 +++++++++++++++++++++++++++++++++++++++
+ llm/llama_server.go      | 221 ++++++++++++++++++++--
+ llm/llama_server_test.go | 395 +++++++++++++++++++++++++++++++++++++++
  server/sched.go          |   8 +-
  server/sched_test.go     |   2 +
- 4 files changed, 316 insertions(+), 17 deletions(-)
+ 4 files changed, 609 insertions(+), 17 deletions(-)
 
 diff --git a/llm/llama_server.go b/llm/llama_server.go
-index 4d3928b..c8e9983 100644
+index 4d3928b..053782a 100644
 --- a/llm/llama_server.go
 +++ b/llm/llama_server.go
-@@ -2848,25 +2848,144 @@ func (s *llamaServerRunner) MemorySize() (total, vram uint64) {
+@@ -2848,25 +2848,220 @@ func (s *llamaServerRunner) MemorySize() (total, vram uint64) {
  	return total, vram
  }
  
-+// llamaServerMaxUbatch is the largest physical batch (-ub) Ollama passes to
-+// llama-server. A sliding-window cache holds the window plus one batch, so
-+// sizing it with the largest batch keeps the estimate from falling short.
++// llamaServerMaxUbatch is the largest physical batch (-ub) the automatic
++// batch selection passes to llama-server. A sliding-window cache holds the
++// window plus one batch, so the window is sized with the larger of this and
++// an explicit num_batch, which appendBatchArgs passes through as -ub.
 +const llamaServerMaxUbatch = 2048
 +
  // PredictServerVRAM estimates VRAM usage for a model without spawning llama-server.
@@ -57,25 +65,30 @@ index 4d3928b..c8e9983 100644
 -func PredictServerVRAM(modelPath string, f *gguf.Model, numCtx int) uint64 {
 +// Weights use the model file size, which also covers a projector stored in the
 +// same file. The KV cache follows llama.cpp's per-layer allocation. The compute
-+// graph is not counted; the scheduler's headroom absorbs it.
-+func PredictServerVRAM(modelPath string, f *gguf.Model, numCtx, numParallel int) uint64 {
++// graph and the recurrent state of hybrid models are not counted; the
++// scheduler's headroom absorbs them. opts is the request's options: an
++// explicit num_batch widens a sliding window (the automatic batch, chosen
++// later, never exceeds llamaServerMaxUbatch), and draft_num_predict turns on
++// the MTP draft context, which holds the cache of a model's MTP layers.
++func PredictServerVRAM(modelPath string, f *gguf.Model, numCtx, numParallel int, opts api.Options) uint64 {
  	weights := modelFileSize(modelPath, f)
-+	kvCache := predictKVCache(f.KV(), numCtx, numParallel, envconfig.KvCacheType())
++	kvCache := predictKVCache(f.KV(), numCtx, numParallel, opts.NumBatch, opts.DraftNumPredict > 0, envconfig.KvCacheType())
++
++	return weights + kvCache
++}
  
 -	// KV cache: 2 (K+V) * layers * kv_heads * head_dim * context * 2 bytes (f16)
 -	layers := f.KV().BlockCount()
 -	kvHeads := f.KV().HeadCountKVMin()
 -	if kvHeads == 0 {
 -		kvHeads = 1
-+	return weights + kvCache
-+}
-+
 +// predictKVCache mirrors llama.cpp's KV cache allocation. Each layer stores
 +// key_length and value_length values per KV head for every cell. Layers with
-+// no KV heads (recurrent layers in hybrid models) store nothing, layers marked
-+// in sliding_window_pattern store only the window, and non-causal models
-+// (embedding encoders) keep no cache at all.
-+func predictKVCache(kv *gguf.Metadata, numCtx, numParallel int, cacheType string) uint64 {
++// no KV heads (recurrent layers in hybrid models) store nothing, as do the
++// layers kvCacheLayers rules out. Layers marked in sliding_window_pattern
++// store only the window, and non-causal models (embedding encoders) keep no
++// cache at all.
++func predictKVCache(kv *gguf.Metadata, numCtx, numParallel, numBatch int, mtpDraft bool, cacheType string) uint64 {
 +	if !kv.Bool("attention.causal", true) {
 +		return 0
  	}
@@ -90,8 +103,9 @@ index 4d3928b..c8e9983 100644
  	}
 -	kvCache := 2 * layers * kvHeads * headDim * uint64(numCtx) * 2
 +	headCountKV := layerValues(kv, "attention.head_count_kv", layers, headCount)
- 
--	return weights + kvCache
++	ownCache := kvCacheLayers(kv, layers, mtpDraft)
++	keysOnly := kvCacheKeysOnly(kv)
++
 +	headK := kv.Uint("attention.key_length", kv.EmbeddingLength()/headCount[0])
 +	headV := kv.Uint("attention.value_length", kv.EmbeddingLength()/headCount[0])
 +	headKSWA := kv.Uint("attention.key_length_swa", headK)
@@ -106,7 +120,8 @@ index 4d3928b..c8e9983 100644
 +	}
 +
 +	cells := uint64(max(numCtx, 0))
-+	swaCells := min(cells, uint64(max(numParallel, 1))*(window+llamaServerMaxUbatch))
++	ubatch := uint64(max(llamaServerMaxUbatch, numBatch))
++	swaCells := min(cells, uint64(max(numParallel, 1))*(window+ubatch))
 +	swaCells = (swaCells + 255) / 256 * 256
 +
 +	widthK := make([]uint64, layers)
@@ -117,6 +132,9 @@ index 4d3928b..c8e9983 100644
 +		if swa != nil && swa[il] {
 +			k, v = headKSWA, headVSWA
 +		}
++		if keysOnly {
++			v = 0
++		}
 +		widthK[il] = headCountKV[il] * k
 +		widthV[il] = headCountKV[il] * v
 +		widestV = max(widestV, widthV[il])
@@ -124,16 +142,18 @@ index 4d3928b..c8e9983 100644
 +
 +	// A quantized V cache requires flash attention, which stores V as is.
 +	// Without flash attention llama.cpp transposes V and pads every layer to
-+	// the widest one, so unquantized caches are sized that way.
++	// the widest one, counting layers with no cache of their own, so
++	// unquantized caches are sized that way.
 +	bytesPer32 := kvCacheBytesPer32(cacheType)
 +	quantized := bytesPer32 < kvCacheBytesPer32("f16")
 +
 +	var values uint64
 +	for il := range layers {
-+		if widthK[il] == 0 {
++		if widthK[il] == 0 || !ownCache[il] {
 +			continue
 +		}
-+
+ 
+-	return weights + kvCache
 +		v := widthV[il]
 +		if !quantized {
 +			v = widestV
@@ -148,6 +168,69 @@ index 4d3928b..c8e9983 100644
 +	}
 +
 +	return values * bytesPer32 / 32
++}
++
++// kvCacheLayers reports which layers get a KV cache of their own in the main
++// context. Beyond layers with no KV heads, llama.cpp gives none to:
++//
++//   - MTP layers, the last nextn_predict_layers blocks. Their cache lives in
++//     the MTP draft context, which exists only when drafting is on. A
++//     graniteswitch model reuses the key for a router layer the trunk
++//     attends, so it keeps its cache.
++//   - recurrent layers of qwen3next, qwen35 and qwen35moe, which are marked
++//     by attention.recurrent_layers, or else are every layer but each
++//     full_attention_interval-th (4 when the key is missing).
++//   - the gemma layers that read an earlier layer's cache: the last
++//     attention.shared_kv_layers of gemma4, and layer 20 onward of gemma3n.
++//
++// These rules are per architecture in llama.cpp, so only the architectures
++// checked there are listed. Any other is sized as if every layer had a
++// cache, which can only overestimate.
++func kvCacheLayers(kv *gguf.Metadata, layers int, mtpDraft bool) []bool {
++	own := slices.Repeat([]bool{true}, layers)
++	arch := kv.Architecture()
++
++	trunk := layers
++	if nextn := int(kv.Uint("nextn_predict_layers")); nextn > 0 && nextn < layers && arch != "graniteswitch" {
++		trunk = layers - nextn
++		for il := trunk; il < layers; il++ {
++			own[il] = mtpDraft
++		}
++	}
++
++	shared := trunk
++	switch arch {
++	case "qwen3next", "qwen35", "qwen35moe":
++		recurrent := kv.KeyValue("attention.recurrent_layers").Bools()
++		interval := int(kv.Uint("full_attention_interval", 4))
++		for il := range trunk {
++			if len(recurrent) == layers {
++				own[il] = !recurrent[il]
++			} else if interval > 0 {
++				own[il] = (il+1)%interval == 0
++			}
++		}
++	case "gemma4":
++		if n := int(kv.Uint("attention.shared_kv_layers")); n > 0 && n < layers {
++			shared = layers - n
++		}
++	case "gemma3n":
++		shared = min(20, layers)
++	}
++	for il := shared; il < trunk; il++ {
++		own[il] = false
++	}
++
++	return own
++}
++
++// kvCacheKeysOnly reports a multi-head latent attention cache, which stores K
++// and no V. Other architectures with the MLA keys also allocate an indexer
++// cache that is not estimated here, so they keep the V term as cover.
++func kvCacheKeysOnly(kv *gguf.Metadata) bool {
++	return kv.Architecture() == "deepseek2" &&
++		kv.Uint("attention.key_length_mla") > 0 &&
++		kv.Uint("attention.value_length_mla") > 0
 +}
 +
 +// layerValues returns one value per layer for key. GGUF stores these either as
@@ -201,7 +284,7 @@ index 4d3928b..c8e9983 100644
  
  // memoryParsingWriter wraps an io.Writer and parses llama-server log output
 diff --git a/llm/llama_server_test.go b/llm/llama_server_test.go
-index 063c9c5..e58f1a1 100644
+index 063c9c5..0d8508d 100644
 --- a/llm/llama_server_test.go
 +++ b/llm/llama_server_test.go
 @@ -8,6 +8,7 @@ import (
@@ -212,7 +295,7 @@ index 063c9c5..e58f1a1 100644
  	"net"
  	"net/http"
  	"net/http/httptest"
-@@ -4068,3 +4069,180 @@ func TestLlamaServerCompletionThinkingFormat(t *testing.T) {
+@@ -4068,3 +4069,397 @@ func TestLlamaServerCompletionThinkingFormat(t *testing.T) {
  		t.Errorf("json format converted a schema, %d conversions", got)
  	}
  }
@@ -259,6 +342,8 @@ index 063c9c5..e58f1a1 100644
 +		kv          gguftest.KV
 +		numCtx      int
 +		numParallel int
++		numBatch    int
++		mtpDraft    bool
 +		cacheType   string
 +		want        uint64
 +	}{
@@ -322,6 +407,19 @@ index 063c9c5..e58f1a1 100644
 +			want: (4*8+4*8)*1024*34/32 + (2*16+2*16)*1024*34/32,
 +		},
 +		{
++			// An explicit num_batch reaches llama-server as -ub, so the
++			// window holds it: 256 + 8192 = 8448 cells.
++			name: "explicit num_batch widens the window", kv: sliding,
++			numCtx: 32768, numParallel: 1, numBatch: 8192, cacheType: "q8_0",
++			want: (4*8+4*8)*8448*34/32 + (2*16+2*16)*32768*34/32,
++		},
++		{
++			// A num_batch below the automatic maximum changes nothing.
++			name: "small num_batch keeps the automatic window", kv: sliding,
++			numCtx: 32768, numParallel: 1, numBatch: 512, cacheType: "q8_0",
++			want: (4*8+4*8)*2304*34/32 + (2*16+2*16)*32768*34/32,
++		},
++		{
 +			name: "scalar pattern sizes every layer as full",
 +			kv: with(sliding, gguftest.KV{
 +				"gemma4.attention.sliding_window_pattern": uint32(2),
@@ -346,7 +444,7 @@ index 063c9c5..e58f1a1 100644
 +	for _, tc := range cases {
 +		t.Run(tc.name, func(t *testing.T) {
 +			kv := loadTestGGUF(t, tc.kv).KV()
-+			got := predictKVCache(kv, tc.numCtx, tc.numParallel, tc.cacheType)
++			got := predictKVCache(kv, tc.numCtx, tc.numParallel, tc.numBatch, tc.mtpDraft, tc.cacheType)
 +			if got != tc.want {
 +				t.Errorf("predictKVCache() = %d, want %d", got, tc.want)
 +			}
@@ -356,9 +454,10 @@ index 063c9c5..e58f1a1 100644
 +
 +// TestPredictKVCacheGemma4 checks the estimate against what llama-server
 +// allocated for gemma4:31b at 262144 context with a q8_0 cache and -ub 2048,
-+// the largest batch the estimate assumes: 10880 MiB for the 10 full layers
-+// plus 1275 MiB for the 50 sliding layers (3072 cells). The estimate may not
-+// fall below that, and should stay close to it.
++// the largest automatic batch: 10880 MiB for the 10 full layers plus 1275 MiB
++// for the 50 sliding layers (3072 cells). The estimate may not fall below
++// that, and should stay close to it. With an explicit num_batch of 8192 the
++// sliding cache grows to 9216 cells, 3825 MiB, and the estimate must follow.
 +func TestPredictKVCacheGemma4(t *testing.T) {
 +	headCountKV := make([]uint32, 60)
 +	pattern := make([]bool, 60)
@@ -385,16 +484,217 @@ index 063c9c5..e58f1a1 100644
 +	}).KV()
 +
 +	const measured = (10880 + 1275) << 20
-+	got := predictKVCache(kv, 262144, 1, "q8_0")
++	got := predictKVCache(kv, 262144, 1, 0, false, "q8_0")
 +	if got < measured {
 +		t.Errorf("predicted %d MiB, below the %d MiB llama-server allocated", got>>20, measured>>20)
 +	}
 +	if got > measured*11/10 {
 +		t.Errorf("predicted %d MiB, more than 10%% above the %d MiB llama-server allocated", got>>20, measured>>20)
 +	}
++
++	const measuredWideBatch = (10880 + 3825) << 20
++	got = predictKVCache(kv, 262144, 1, 8192, false, "q8_0")
++	if got != measuredWideBatch {
++		t.Errorf("with num_batch 8192 predicted %d MiB, want %d MiB", got>>20, measuredWideBatch>>20)
++	}
++}
++
++// TestPredictKVCacheLayers covers the layers llama.cpp gives no KV cache of
++// their own. Every fixture layer has 2 KV heads of 16 keys and 16 values, so
++// at 100 cells and f16 a layer with a cache holds 12800 bytes.
++func TestPredictKVCacheLayers(t *testing.T) {
++	const perLayer = (2*16 + 2*16) * 100 * 2
++
++	model := func(arch string, layers uint32, extra gguftest.KV) gguftest.KV {
++		kv := gguftest.KV{
++			"general.architecture":            arch,
++			arch + ".block_count":             layers,
++			arch + ".embedding_length":        uint32(64),
++			arch + ".attention.head_count":    uint32(4),
++			arch + ".attention.head_count_kv": uint32(2),
++		}
++		for k, v := range extra {
++			kv[arch+"."+k] = v
++		}
++		return kv
++	}
++
++	cases := []struct {
++		name     string
++		kv       gguftest.KV
++		mtpDraft bool
++		want     uint64
++	}{
++		{
++			name: "qwen35 recurrent_layers array",
++			kv: model("qwen35", 8, gguftest.KV{
++				"attention.recurrent_layers": []bool{true, true, true, false, true, true, true, false},
++			}),
++			want: 2 * perLayer,
++		},
++		{
++			name: "qwen35 full_attention_interval without the array",
++			kv:   model("qwen35", 8, gguftest.KV{"full_attention_interval": uint32(2)}),
++			want: 4 * perLayer,
++		},
++		{
++			name: "qwen35 defaults to an interval of 4",
++			kv:   model("qwen35", 8, nil),
++			want: 2 * perLayer,
++		},
++		{
++			name: "qwen35moe and qwen3next follow the same rule",
++			kv:   model("qwen35moe", 8, nil),
++			want: 2 * perLayer,
++		},
++		{
++			name: "qwen35 mtp layer has no cache without drafting",
++			kv:   model("qwen35", 9, gguftest.KV{"nextn_predict_layers": uint32(1)}),
++			want: 2 * perLayer,
++		},
++		{
++			name:     "qwen35 mtp layer has a cache when drafting",
++			kv:       model("qwen35", 9, gguftest.KV{"nextn_predict_layers": uint32(1)}),
++			mtpDraft: true,
++			want:     3 * perLayer,
++		},
++		{
++			name: "dense model mtp layer has no cache without drafting",
++			kv:   model("llama", 5, gguftest.KV{"nextn_predict_layers": uint32(1)}),
++			want: 4 * perLayer,
++		},
++		{
++			name:     "dense model mtp layer has a cache when drafting",
++			kv:       model("llama", 5, gguftest.KV{"nextn_predict_layers": uint32(1)}),
++			mtpDraft: true,
++			want:     5 * perLayer,
++		},
++		{
++			name: "graniteswitch router layer keeps its cache",
++			kv:   model("graniteswitch", 5, gguftest.KV{"nextn_predict_layers": uint32(1)}),
++			want: 5 * perLayer,
++		},
++		{
++			name: "full_attention_interval is ignored on other architectures",
++			kv:   model("llama", 8, gguftest.KV{"full_attention_interval": uint32(4)}),
++			want: 8 * perLayer,
++		},
++		{
++			name: "gemma4 shared layers have no cache",
++			kv:   model("gemma4", 6, gguftest.KV{"attention.shared_kv_layers": uint32(2)}),
++			want: 4 * perLayer,
++		},
++		{
++			name: "gemma4 without shared layers is unchanged",
++			kv:   model("gemma4", 6, gguftest.KV{"attention.shared_kv_layers": uint32(0)}),
++			want: 6 * perLayer,
++		},
++		{
++			name: "gemma3n shares from layer 20",
++			kv:   model("gemma3n", 30, nil),
++			want: 20 * perLayer,
++		},
++		{
++			name: "shared_kv_layers is ignored on other architectures",
++			kv:   model("llama", 6, gguftest.KV{"attention.shared_kv_layers": uint32(2)}),
++			want: 6 * perLayer,
++		},
++		{
++			name: "deepseek2 mla stores keys only",
++			kv: model("deepseek2", 2, gguftest.KV{
++				"attention.key_length_mla":   uint32(8),
++				"attention.value_length_mla": uint32(8),
++			}),
++			want: 2 * (2 * 16) * 100 * 2,
++		},
++		{
++			name: "mla keys keep V on architectures with an indexer cache",
++			kv: model("deepseek32", 2, gguftest.KV{
++				"attention.key_length_mla":   uint32(8),
++				"attention.value_length_mla": uint32(8),
++			}),
++			want: 2 * perLayer,
++		},
++	}
++
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			kv := loadTestGGUF(t, tc.kv).KV()
++			got := predictKVCache(kv, 100, 1, 0, tc.mtpDraft, "f16")
++			if got != tc.want {
++				t.Errorf("predictKVCache() = %d, want %d", got, tc.want)
++			}
++		})
++	}
++}
++
++// TestPredictKVCacheQwen35 checks the estimate against what llama-server
++// allocated for qwen3.5:0.8b at 32768 context with a q8_0 cache:
++// "llama_kv_cache: size = 204.00 MiB (32768 cells, 6 layers)". The model has
++// 24 layers, of which every fourth is not recurrent.
++func TestPredictKVCacheQwen35(t *testing.T) {
++	recurrent := make([]bool, 24)
++	for il := range 24 {
++		recurrent[il] = il%4 != 3
++	}
++
++	kv := loadTestGGUF(t, gguftest.KV{
++		"general.architecture":              "qwen35",
++		"qwen35.block_count":                uint32(24),
++		"qwen35.embedding_length":           uint32(1024),
++		"qwen35.attention.head_count":       uint32(8),
++		"qwen35.attention.head_count_kv":    uint32(2),
++		"qwen35.attention.key_length":       uint32(256),
++		"qwen35.attention.value_length":     uint32(256),
++		"qwen35.attention.recurrent_layers": recurrent,
++		"qwen35.full_attention_interval":    uint32(4),
++	}).KV()
++
++	const measured = 204 << 20
++	if got := predictKVCache(kv, 32768, 1, 0, false, "q8_0"); got != measured {
++		t.Errorf("predicted %d bytes, llama-server allocated %d", got, measured)
++	}
++}
++
++// TestPredictKVCacheGemma4Shared checks the estimate against what
++// llama-server allocated for gemma4:e2b at 32768 context with a q8_0 cache
++// and -ub 1024. The model has 35 layers and shared_kv_layers = 20, so only
++// the first 15 have a cache: 102.00 MiB for 3 full layers and 9.56 MiB for
++// 12 sliding layers (1536 cells). The estimate sizes the window for -ub
++// 2048, so it may run a little over; it may not fall below.
++func TestPredictKVCacheGemma4Shared(t *testing.T) {
++	pattern := make([]bool, 35)
++	for il := range 35 {
++		pattern[il] = il%5 != 4
++	}
++
++	kv := loadTestGGUF(t, gguftest.KV{
++		"general.architecture":                    "gemma4",
++		"gemma4.block_count":                      uint32(35),
++		"gemma4.embedding_length":                 uint32(1536),
++		"gemma4.attention.head_count":             uint32(8),
++		"gemma4.attention.head_count_kv":          uint32(1),
++		"gemma4.attention.key_length":             uint32(512),
++		"gemma4.attention.value_length":           uint32(512),
++		"gemma4.attention.key_length_swa":         uint32(256),
++		"gemma4.attention.value_length_swa":       uint32(256),
++		"gemma4.attention.sliding_window":         uint32(512),
++		"gemma4.attention.sliding_window_pattern": pattern,
++		"gemma4.attention.shared_kv_layers":       uint32(20),
++	}).KV()
++
++	// 102.00 MiB + 9.56 MiB, in bytes.
++	const measured = 106954752 + 10027008
++	got := predictKVCache(kv, 32768, 1, 1024, true, "q8_0")
++	if got < measured {
++		t.Errorf("predicted %d bytes, below the %d llama-server allocated", got, measured)
++	}
++	if got > measured*11/10 {
++		t.Errorf("predicted %d bytes, more than 10%% above the %d llama-server allocated", got, measured)
++	}
 +}
 diff --git a/server/sched.go b/server/sched.go
-index 14a78db..57a9b18 100644
+index 14a78db..346dbe7 100644
 --- a/server/sched.go
 +++ b/server/sched.go
 @@ -569,7 +569,7 @@ func (s *Scheduler) load(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.De
@@ -402,7 +702,7 @@ index 14a78db..57a9b18 100644
  
  			predictedCtx := effectiveLlamaServerContext(req.opts.NumCtx, f, numParallel)
 -			predicted := llm.PredictServerVRAM(req.model.ModelPath, f, predictedCtx)
-+			predicted := llm.PredictServerVRAM(req.model.ModelPath, f, predictedCtx, numParallel)
++			predicted := llm.PredictServerVRAM(req.model.ModelPath, f, predictedCtx, numParallel, req.opts)
  			loadGpus, launchOpts = selectLlamaServerPlacement(systemInfo, gpus, predicted, req.opts)
  			availableForBatch, _, _ := availableMemoryForPlacement(systemInfo, loadGpus, launchOpts)
  			flashAttention := llm.LlamaServerFlashAttention(loadGpus)
@@ -411,7 +711,7 @@ index 14a78db..57a9b18 100644
  	req.opts.NumCtx = newNumCtx
  	predictedCtx := effectiveLlamaServerContext(req.opts.NumCtx, f, numParallel)
 -	predictedVRAM := llm.PredictServerVRAM(req.model.ModelPath, f, predictedCtx)
-+	predictedVRAM := llm.PredictServerVRAM(req.model.ModelPath, f, predictedCtx, numParallel)
++	predictedVRAM := llm.PredictServerVRAM(req.model.ModelPath, f, predictedCtx, numParallel, req.opts)
  	available, _, _ := availableMemoryForPlacement(systemInfo, gpus, launchOpts)
  	req.applyAutomaticGenerationBatch(completion, predictedCtx, predictedVRAM, available, llm.LlamaServerFlashAttention(gpus), gpus)
  	newNumBatch = req.opts.NumBatch
@@ -420,7 +720,7 @@ index 14a78db..57a9b18 100644
  func (s *Scheduler) applyLlamaServerMmapDefaults(req *LlmRequest, launchOpts api.Options, systemInfo ml.SystemInfo, gpus []ml.DeviceInfo, f *gguf.Model, numParallel int) api.Options {
  	predictedCtx := effectiveLlamaServerContext(req.opts.NumCtx, f, numParallel)
 -	predictedVRAM := llm.PredictServerVRAM(req.model.ModelPath, f, predictedCtx)
-+	predictedVRAM := llm.PredictServerVRAM(req.model.ModelPath, f, predictedCtx, numParallel)
++	predictedVRAM := llm.PredictServerVRAM(req.model.ModelPath, f, predictedCtx, numParallel, req.opts)
  	availableVRAM, _, _ := availableMemoryForPlacement(systemInfo, gpus, launchOpts)
  
  	if reason := disableMmapDefaultReason(runtime.GOOS, req.opts, gpus, f.KV().BlockCount(), predictedVRAM, availableVRAM); reason != "" {
@@ -429,7 +729,7 @@ index 14a78db..57a9b18 100644
  	loadedMmapSize := s.loadedMmapModelSizeLocked()
  	predictedCtx := effectiveLlamaServerContext(req.opts.NumCtx, f, numParallel)
 -	predictedVRAM := llm.PredictServerVRAM(req.model.ModelPath, f, predictedCtx)
-+	predictedVRAM := llm.PredictServerVRAM(req.model.ModelPath, f, predictedCtx, numParallel)
++	predictedVRAM := llm.PredictServerVRAM(req.model.ModelPath, f, predictedCtx, numParallel, req.opts)
  	availableVRAM, _, _ := availableMemoryForPlacement(systemInfo, gpus, launchOpts)
  	placementGpus := gpusForPlacement(gpus, launchOpts)
  

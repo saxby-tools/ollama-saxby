@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Niko Lowry <niko@neeks.me>
 Date: Fri, 30 Oct 2026 19:08:01 -0400
-Subject: [PATCH 5/5] server: give MLX loads the llama-server memory pre-flight
+Subject: [PATCH 4/4] server: give MLX loads the llama-server memory pre-flight
 
 The scheduler predicts a llama-server load's memory, evicts when it
 does not fit beside the loaded models, and books the runner at that
@@ -748,7 +748,7 @@ index 0000000..d73e4cc
 +	}
 +}
 diff --git a/server/sched.go b/server/sched.go
-index 7f7a69c..e42f6cd 100644
+index 8d0522e..548eb86 100644
 --- a/server/sched.go
 +++ b/server/sched.go
 @@ -78,11 +78,28 @@ type Scheduler struct {
