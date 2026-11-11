@@ -85,19 +85,19 @@ Ollama runs CI on a fork's PR only after a maintainer approves it, so
 ##  A clean merge is not a passing patch
 
 CI proves a patch still applies and Ollama's tests still pass. It does
-not prove the patch still does its job. On v0.40.15, patch 0003 would
+not prove the patch still does its job. On v0.40.15, patch 0002 would
 have merged with a one-line comment fix, and been wrong: llama.cpp
 b12111 began printing a rotation buffer line after each KV cache, and
-0003 added up only adjacent lines, so it would have gone back to
+0002 added up only adjacent lines, so it would have gone back to
 undercounting a model by gigabytes. Its own tests did not cover the
 new log order, so they passed.
 
 When a release changes `LLAMA_CPP_VERSION`, read what changed for each
 patch that depends on llama.cpp's behaviour:
 
-- 0001 and 0002 mirror how llama.cpp sizes the KV cache
+- 0001 mirrors how llama.cpp sizes the KV cache
   (`src/llama-kv-cache*.cpp`, `src/llama-model.cpp`).
-- 0003 parses llama-server's "buffer size" log lines.
+- 0002 parses llama-server's "buffer size" log lines.
 
 Ollama does not vendor llama.cpp; read it at the pinned tag:
 
