@@ -180,6 +180,10 @@ Ollama, behind the `local.ollama` LaunchAgent.
 - The interactive shell is zsh with `noclobber` and `cp -i`/`rm -i`
   aliases, and `diff` is a function. In one-off commands use `>|`,
   `/bin/cp`, `/bin/rm` and `/usr/bin/diff`.
+- zsh does not word-split an unquoted variable, so
+  `for f in $files` runs once with the whole list as one word and
+  `git diff -- $files` matches nothing. Loop with `while read -r`,
+  or run the loop under `/bin/bash -c`.
 
 ##  Commits and pushes
 
