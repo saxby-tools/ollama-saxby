@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Niko Lowry <niko@neeks.me>
-Date: Mon, 26 Oct 2026 22:15:55 -0400
+Date: Sat, 21 Nov 2026 04:43:26 -0500
 Subject: [PATCH 3/4] server: wait for system memory after unloading on Metal
 
 waitForVRAMRecovery returned at once for Metal and integrated GPUs.
@@ -27,10 +27,10 @@ Ollama-PR: https://github.com/ollama/ollama/pull/19325
  2 files changed, 101 insertions(+), 22 deletions(-)
 
 diff --git a/server/sched.go b/server/sched.go
-index 346dbe7..8d0522e 100644
+index 941bbcc..45eee14 100644
 --- a/server/sched.go
 +++ b/server/sched.go
-@@ -1475,26 +1475,40 @@ func (runner *runnerRef) needsReload(ctx context.Context, req *LlmRequest) bool
+@@ -1486,26 +1486,40 @@ func (runner *runnerRef) reloadReason(ctx context.Context, req *LlmRequest) stri
  // a before and after GPU memory allocation.  The returned channel
  // will be notified when we're done waiting, or have timed out and should
  // proceed anyway
@@ -81,7 +81,7 @@ index 346dbe7..8d0522e 100644
  	freeMemoryNow := freeMemoryBefore
  
  	go func() {
-@@ -1506,21 +1520,15 @@ func (s *Scheduler) waitForVRAMRecovery(runner *runnerRef, runners []ml.Filtered
+@@ -1517,21 +1531,15 @@ func (s *Scheduler) waitForVRAMRecovery(runner *runnerRef, runners []ml.Filtered
  		for {
  			select {
  			case <-ticker.C:
@@ -110,10 +110,10 @@ index 346dbe7..8d0522e 100644
  					finished <- struct{}{}
  					return
 diff --git a/server/sched_test.go b/server/sched_test.go
-index 8d84ee0..ecedf86 100644
+index c1b5e10..9dc5237 100644
 --- a/server/sched_test.go
 +++ b/server/sched_test.go
-@@ -2304,3 +2304,74 @@ func TestSchedulerTracksMultipleLoadedRunners(t *testing.T) {
+@@ -2386,3 +2386,74 @@ func TestSchedulerTracksMultipleLoadedRunners(t *testing.T) {
  	expectedFree := uint64(24*format.GigaByte) - uint64(8*format.GigaByte) - uint64(4*format.GigaByte)
  	require.Equal(t, expectedFree, gpus[0].FreeMemory)
  }

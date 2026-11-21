@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Niko Lowry <niko@neeks.me>
-Date: Mon, 26 Oct 2026 22:13:08 -0400
+Date: Sat, 21 Nov 2026 04:43:26 -0500
 Subject: [PATCH 2/4] llm: add up repeated buffer lines within a load
 
 memoryParsingWriter stored each buffer line under its component,
@@ -30,10 +30,10 @@ Ollama-PR: https://github.com/ollama/ollama/pull/19324
  2 files changed, 94 insertions(+), 2 deletions(-)
 
 diff --git a/llm/llama_server.go b/llm/llama_server.go
-index 053782a..2a5a0c4 100644
+index 5888c83..93affb9 100644
 --- a/llm/llama_server.go
 +++ b/llm/llama_server.go
-@@ -3082,6 +3082,16 @@ type memoryParsingWriter struct {
+@@ -3147,6 +3147,16 @@ type memoryParsingWriter struct {
  	inner   io.Writer
  	runner  *llamaServerRunner
  	buffers map[memoryBufferKey]memoryBuffer
@@ -50,7 +50,7 @@ index 053782a..2a5a0c4 100644
  }
  
  type memoryBufferKey struct {
-@@ -3092,6 +3102,7 @@ type memoryBufferKey struct {
+@@ -3157,6 +3167,7 @@ type memoryBufferKey struct {
  
  type memoryBuffer struct {
  	bytes uint64
@@ -58,7 +58,7 @@ index 053782a..2a5a0c4 100644
  }
  
  // deviceFreeRegex matches per-device free VRAM reported at model load time:
-@@ -3172,11 +3183,21 @@ func (w *memoryParsingWriter) Write(b []byte) (int, error) {
+@@ -3237,11 +3248,21 @@ func (w *memoryParsingWriter) Write(b []byte) (int, error) {
  					if w.buffers == nil {
  						w.buffers = make(map[memoryBufferKey]memoryBuffer)
  					}
@@ -83,10 +83,10 @@ index 053782a..2a5a0c4 100644
  				}
  			}
 diff --git a/llm/llama_server_test.go b/llm/llama_server_test.go
-index 0d8508d..54fbfc7 100644
+index 402c870..3a19998 100644
 --- a/llm/llama_server_test.go
 +++ b/llm/llama_server_test.go
-@@ -3166,6 +3166,77 @@ func TestMemoryParsingWriter(t *testing.T) {
+@@ -3203,6 +3203,77 @@ func TestMemoryParsingWriter(t *testing.T) {
  			wantGPU:   1100 + 2200 + 330 + 10 + 20,
  			wantTotal: 1100 + 2200 + 330 + 440 + 10 + 20,
  		},

@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Niko Lowry <niko@neeks.me>
-Date: Fri, 30 Oct 2026 19:08:01 -0400
+Date: Sat, 21 Nov 2026 04:44:49 -0500
 Subject: [PATCH 4/4] server: give MLX loads the llama-server memory pre-flight
 
 The scheduler predicts a llama-server load's memory, evicts when it
@@ -35,14 +35,14 @@ Ollama-PR: https://github.com/ollama/ollama/pull/19419
  mlxrunner/client_test.go   |  14 ++
  mlxrunner/estimate.go      | 333 +++++++++++++++++++++++++++++++++++++
  mlxrunner/estimate_test.go | 259 +++++++++++++++++++++++++++++
- server/sched.go            |  69 +++++++-
+ server/sched.go            |  68 +++++++-
  server/sched_test.go       | 121 ++++++++++++++
- 6 files changed, 815 insertions(+), 13 deletions(-)
+ 6 files changed, 815 insertions(+), 12 deletions(-)
  create mode 100644 mlxrunner/estimate.go
  create mode 100644 mlxrunner/estimate_test.go
 
 diff --git a/mlxrunner/client.go b/mlxrunner/client.go
-index 0d46c83..e8550f6 100644
+index 50b9d12..024a29d 100644
 --- a/mlxrunner/client.go
 +++ b/mlxrunner/client.go
 @@ -27,10 +27,8 @@ import (
@@ -56,9 +56,9 @@ index 0d46c83..e8550f6 100644
  )
  
  // Client wraps an MLX runner subprocess to implement llm.LlamaServer for LLM models.
-@@ -40,7 +38,8 @@ type Client struct {
- 	contextLength       atomic.Int64
+@@ -41,7 +39,8 @@ type Client struct {
  	softContextLength   int // recommended limit to avoid poor performance
+ 	numCtxAuto          bool
  	memory              atomic.Uint64
 -	embeddingDimensions atomic.Value // []int
 +	predicted           MemoryEstimate // size once the caches fill; the booked floor
@@ -66,7 +66,7 @@ index 0d46c83..e8550f6 100644
  	done                chan struct{}
  	doneErr             error // valid after done is closed
  	client              *http.Client
-@@ -66,19 +65,22 @@ func NewClient(modelName string, softContextLength int) (*Client, error) {
+@@ -68,19 +67,22 @@ func NewClient(modelName string, softContextLength int, numCtxAuto bool) (*Clien
  		client:            http.DefaultClient,
  	}
  
@@ -95,7 +95,7 @@ index 0d46c83..e8550f6 100644
  // CheckRuntime reports whether an MLX dynamic library was loaded successfully.
  func CheckRuntime() error {
  	if _, err := mlx.LoadedLibraryPath(); err != nil {
-@@ -627,15 +629,23 @@ func (c *Client) currentMemory() uint64 {
+@@ -663,15 +665,23 @@ func (c *Client) currentMemory() uint64 {
  	return c.memory.Load()
  }
  
@@ -122,14 +122,13 @@ index 0d46c83..e8550f6 100644
  
  var _ llm.LlamaServer = (*Client)(nil)
 diff --git a/mlxrunner/client_test.go b/mlxrunner/client_test.go
-index 0f231a6..d4459a8 100644
+index 985eeb1..844a4f7 100644
 --- a/mlxrunner/client_test.go
 +++ b/mlxrunner/client_test.go
-@@ -47,3 +47,17 @@ func TestRequestGrammar(t *testing.T) {
- 		})
+@@ -56,6 +56,20 @@ func TestRequestGrammar(t *testing.T) {
  	}
  }
-+
+ 
 +func TestClientBooksPredictedMemory(t *testing.T) {
 +	c := &Client{predicted: MemoryEstimate{Weights: 16, KVCache: 8, PrefixCache: 4}}
 +
@@ -143,6 +142,10 @@ index 0f231a6..d4459a8 100644
 +		t.Errorf("booked(40) = %d, want 40", got)
 +	}
 +}
++
+ func TestInkling2StructuredGrammarFrames(t *testing.T) {
+ 	const (
+ 		thoughtOpen int32 = iota
 diff --git a/mlxrunner/estimate.go b/mlxrunner/estimate.go
 new file mode 100644
 index 0000000..f50124e
@@ -748,14 +751,14 @@ index 0000000..d73e4cc
 +	}
 +}
 diff --git a/server/sched.go b/server/sched.go
-index 8d0522e..548eb86 100644
+index 45eee14..7f78858 100644
 --- a/server/sched.go
 +++ b/server/sched.go
-@@ -78,11 +78,28 @@ type Scheduler struct {
+@@ -75,11 +75,28 @@ type Scheduler struct {
  
  	loadFn          func(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.DeviceInfo, requireFull bool) bool
  	newServerFn     func(systemInfo ml.SystemInfo, gpus []ml.DeviceInfo, model string, f *gguf.Model, adapters []string, projectors []string, opts api.Options, numParallel int, config llm.LlamaServerConfig) (llm.LlamaServer, error)
-+	newMLXServerFn  func(modelName string, numCtx int) (mlxServer, error)
++	newMLXServerFn  func(modelName string, numCtx int, numCtxAuto bool) (mlxServer, error)
  	getGpuFn        func(ctx context.Context, runners []ml.FilteredRunnerDiscovery) []ml.DeviceInfo
  	getSystemInfoFn func() ml.SystemInfo
  	waitForRecovery time.Duration
@@ -769,8 +772,8 @@ index 8d0522e..548eb86 100644
 +	Predicted() mlxrunner.MemoryEstimate
 +}
 +
-+func newMLXServer(modelName string, numCtx int) (mlxServer, error) {
-+	client, err := mlxrunner.NewClient(modelName, numCtx)
++func newMLXServer(modelName string, numCtx int, numCtxAuto bool) (mlxServer, error) {
++	client, err := mlxrunner.NewClient(modelName, numCtx, numCtxAuto)
 +	if err != nil {
 +		return nil, err
 +	}
@@ -780,7 +783,7 @@ index 8d0522e..548eb86 100644
  // loadedModelsForName returns models still owned by loaded runners. The models
  // are read-only after resolution, so callers may use them after releasing
  // loadedMu even if a runner unloads in the meantime.
-@@ -131,6 +148,7 @@ func InitScheduler(ctx context.Context) *Scheduler {
+@@ -128,6 +145,7 @@ func InitScheduler(ctx context.Context) *Scheduler {
  		unloadedCh:      make(chan any, maxQueue),
  		loaded:          make(map[string]*runnerRef),
  		newServerFn:     llm.NewLlamaServer,
@@ -788,14 +791,13 @@ index 8d0522e..548eb86 100644
  		getGpuFn:        discover.GPUDevices,
  		getSystemInfoFn: discover.GetSystemInfo,
  		waitForRecovery: 5 * time.Second,
-@@ -622,8 +640,19 @@ func (s *Scheduler) load(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.De
+@@ -628,7 +646,19 @@ func (s *Scheduler) load(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.De
  				}
  			}
  		} else {
--			modelName := req.model.ShortName
--			llama, err = mlxrunner.NewClient(modelName, req.opts.NumCtx)
+-			llama, err = mlxrunner.NewClient(req.model.ShortName, req.opts.NumCtx, req.numCtxAuto)
 +			var mlx mlxServer
-+			mlx, err = s.newMLXServerFn(req.model.ShortName, req.opts.NumCtx)
++			mlx, err = s.newMLXServerFn(req.model.ShortName, req.opts.NumCtx, req.numCtxAuto)
 +			if err == nil {
 +				// Pre-flight check: the runner reports only what it holds, which
 +				// at load time is the weights, so without a prediction the cache
@@ -810,7 +812,7 @@ index 8d0522e..548eb86 100644
  		}
  		if err != nil {
  			slog.Info("failed to create server", "model", req.model.ShortName, "error", err)
-@@ -837,6 +866,42 @@ func explicitPartialGPUOffload(opts api.Options, f *gguf.Model) bool {
+@@ -841,6 +871,42 @@ func explicitPartialGPUOffload(opts api.Options, f *gguf.Model) bool {
  	return uint64(opts.NumGPU) < f.KV().BlockCount()+1
  }
  
@@ -854,7 +856,7 @@ index 8d0522e..548eb86 100644
  	return effectiveModelContext(numCtx, f) * max(numParallel, 1)
  }
 diff --git a/server/sched_test.go b/server/sched_test.go
-index ecedf86..83ed9db 100644
+index 9dc5237..84b08f3 100644
 --- a/server/sched_test.go
 +++ b/server/sched_test.go
 @@ -20,6 +20,7 @@ import (
@@ -865,7 +867,7 @@ index ecedf86..83ed9db 100644
  	"github.com/ollama/ollama/types/model"
  )
  
-@@ -2375,3 +2376,123 @@ func TestWaitForVRAMRecoverySharedMemory(t *testing.T) {
+@@ -2457,3 +2458,123 @@ func TestWaitForVRAMRecoverySharedMemory(t *testing.T) {
  		}
  	})
  }
@@ -921,7 +923,7 @@ index ecedf86..83ed9db 100644
 +		mockLlm:   mockLlm{modelPath: "mlx-model", vramSize: 1 * format.GibiByte},
 +		predicted: mlxrunner.MemoryEstimate{Weights: predicted / 2, KVCache: predicted / 2, NumCtx: 4096},
 +	}
-+	s.newMLXServerFn = func(modelName string, numCtx int) (mlxServer, error) {
++	s.newMLXServerFn = func(modelName string, numCtx int, numCtxAuto bool) (mlxServer, error) {
 +		mlx.contextLength = numCtx
 +		return mlx, nil
 +	}
